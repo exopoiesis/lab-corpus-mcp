@@ -1,0 +1,28 @@
+# Build context is the PARENT directory (containing arxiv-radar-mcp/ and
+# lab-corpus-mcp/) — entries below apply at that root level.
+
+# Per-repo developer junk
+**/.venv/
+**/.cache/
+**/.git/
+**/.github/
+**/.claude/
+**/tmp/
+**/docs/
+**/tests/
+**/.pytest_cache/
+**/.ruff_cache/
+**/__pycache__/
+**/*.pyc
+**/*.egg-info/
+**/build/
+**/dist/
+**/*.log
+**/*.swp
+**/.DS_Store
+**/Thumbs.db
+
+# Personal corpora (don't ship into the image)
+literature/
+parsed/
+sources/

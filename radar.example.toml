@@ -1,0 +1,42 @@
+# Example lab-corpus-mcp config. Copy to /srv/lab-corpus/radar.toml on
+# gomer (or wherever your bind-mount points) and adjust.
+#
+# `lab-corpus-mcp` reuses arxiv-radar-mcp's config schema. Sources can be:
+#   - type="local": directory with `data/papers-*.json` shards (arxiv-style)
+#   - type="github": repo on GitHub (raw shard fetch)
+#   - type="literature": directory with MinerU output (one subdir per PDF) — planned
+
+# --- sources -----------------------------------------------------------------
+
+[sources.ai4chem]
+# Optional: pin to a local arxiv-radar-* clone for offline iteration.
+type = "local"
+path = "/data/sources/ai4chem"
+
+# [sources.literature]
+# type = "literature"
+# path = "/data/sources/literature/parsed"   # MinerU output dir
+
+# --- embeddings --------------------------------------------------------------
+# Default model is what we empirically validated against the 14k ai4chem
+# corpus — Qwen3-Embedding-4B at native 2560 dim hit 9/10 recall@1 vs
+# 7/10 for mxbai-large. See arxiv-radar-mcp/docs/MODEL_BENCHMARKS.md.
+[embeddings]
+model      = "Qwen/Qwen3-Embedding-4B"
+cache_dir  = "/cache"
+batch_size = 32
+# target_dim = 1024  # set if you want matryoshka truncation; native = 2560
+
+# --- reranker ----------------------------------------------------------------
+# On Qwen3-4B-native our targeted recall is already at the ceiling (avg
+# rank 1.2). Reranker is more useful for weaker bi-encoders. Off by
+# default; flip on if you swap to a smaller embed model.
+[reranker]
+enabled          = false
+model            = "BAAI/bge-reranker-base"
+top_k_candidates = 50
+
+# --- server ------------------------------------------------------------------
+[server]
+default_k    = 10
+hybrid_rrf_k = 60

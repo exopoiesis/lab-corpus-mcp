@@ -1,0 +1,35 @@
+# Python
+__pycache__/
+*.pyc
+*.pyo
+.venv/
+venv/
+.pytest_cache/
+.ruff_cache/
+*.egg-info/
+build/
+dist/
+
+# Embedding caches & model downloads (regenerable, often huge)
+.cache/
+embeddings_*.npy
+embeddings_*.parquet
+
+# Local literature / parsed corpora — too big and personal for git
+literature/
+parsed/
+sources/
+
+# Local scratch
+tmp/
+
+# Editor / IDE
+.vscode/
+.idea/
+
+# Local Claude Code settings
+.claude/
+
+# OS junk
+.DS_Store
+Thumbs.db
