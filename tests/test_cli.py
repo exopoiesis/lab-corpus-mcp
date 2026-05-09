@@ -30,6 +30,8 @@ def _run(monkeypatch, argv, **patches):
                         _make_recorder("serve_http"))
     monkeypatch.setattr("corpus_core.proxy.run_proxy",
                         _make_recorder("run_proxy"))
+    monkeypatch.setattr("lab_corpus_mcp.combined.serve_combined",
+                        _make_recorder("serve_combined"))
 
     rc = cli.main()
     return rc, record
@@ -88,6 +90,54 @@ def test_remote_and_transport_http_are_mutually_exclusive(monkeypatch):
 def test_unknown_log_level_rejected(monkeypatch):
     monkeypatch.setattr(sys, "argv", [
         "lab-corpus-mcp", "--log-level", "INVALID",
+    ])
+    with pytest.raises(SystemExit):
+        cli.main()
+
+
+# ----- combined mode --------------------------------------------------------
+
+def test_combined_mode_routes_to_supervisor(monkeypatch):
+    rc, rec = _run(monkeypatch, ["--mode", "combined"])
+    assert rc == 0
+    assert "serve_combined" in rec
+    kw = rec["serve_combined"]["kwargs"]
+    # 0.0.0.0 default in combined mode (auto-override of 127.0.0.1).
+    assert kw["host"] == "0.0.0.0"
+    assert kw["arxiv_port"] == 8765
+    assert kw["lab_port"] == 8766
+    assert kw["encoder_lock"] is True
+
+
+def test_combined_mode_custom_ports_and_configs(monkeypatch, tmp_path):
+    arxiv_cfg = tmp_path / "a.toml"
+    lab_cfg = tmp_path / "l.toml"
+    rc, rec = _run(monkeypatch, [
+        "--mode", "combined",
+        "--arxiv-config", str(arxiv_cfg),
+        "--lab-config", str(lab_cfg),
+        "--arxiv-port", "9101",
+        "--lab-port", "9102",
+        "--bind", "10.0.0.5",
+    ])
+    assert rc == 0
+    kw = rec["serve_combined"]["kwargs"]
+    assert kw["arxiv_config_path"] == arxiv_cfg
+    assert kw["lab_config_path"] == lab_cfg
+    assert kw["arxiv_port"] == 9101
+    assert kw["lab_port"] == 9102
+    assert kw["host"] == "10.0.0.5"
+
+
+def test_combined_mode_no_encoder_lock(monkeypatch):
+    rc, rec = _run(monkeypatch, ["--mode", "combined", "--no-encoder-lock"])
+    assert rc == 0
+    assert rec["serve_combined"]["kwargs"]["encoder_lock"] is False
+
+
+def test_combined_mode_rejects_remote(monkeypatch):
+    monkeypatch.setattr(sys, "argv", [
+        "lab-corpus-mcp", "--mode", "combined", "--remote", "user@host",
     ])
     with pytest.raises(SystemExit):
         cli.main()

@@ -79,10 +79,60 @@ bash scripts/docker_build_cache.sh \
 The radar.toml's `[sources.*].path` should reference the in-container
 mount paths (e.g. `/data/sources/ai4chem`). See `radar.example.toml`.
 
-### MCP server for Claude Desktop
+### Combined arxiv-radar + lab-corpus on one Qwen (recommended)
 
-`scripts/docker_serve_mcp.sh` spawns the server bridged to stdio. Wire
-into your Claude Desktop MCP config:
+When you use both backends from the same client, run the **combined**
+container instead of two separate ones — Qwen3-4B is ~8 GB in bf16,
+so two copies don't fit in 12 GB VRAM. The combined supervisor in
+`lab_corpus_mcp.combined` boots both servers in one process, hands
+them the same `Encoder`, and serializes encode calls with a
+`threading.Lock` (peak VRAM ≈ 10 GB).
+
+```bash
+# Start the long-lived container (auto-restart, two ports exposed)
+bash scripts/docker_serve_combined.sh \
+    /srv/arxiv-radar/radar.toml \
+    /srv/lab-corpus/radar.toml \
+    /srv/arxiv-radar/data \
+    /srv/arxiv-radar/cache \
+    /srv/lab-corpus/cache
+
+# Watch logs
+docker --context gomer logs -f lab-corpus-combined
+```
+
+Both backends now reachable on gomer at `:8765` (arxiv-radar) and
+`:8766` (lab-corpus). For Claude Desktop, run two **stdio→HTTP
+proxies** (one per backend) over an SSH tunnel:
+
+```json
+{
+  "mcpServers": {
+    "arxiv-radar": {
+      "command": "lab-corpus-mcp",
+      "args": ["--remote", "you@gomer", "--remote-port", "8765"]
+    },
+    "lab-corpus": {
+      "command": "lab-corpus-mcp",
+      "args": ["--remote", "you@gomer", "--remote-port", "8766"]
+    }
+  }
+}
+```
+
+The supervisor refuses to start if the two `radar.toml` files
+disagree on `[embeddings].model` or `[embeddings].target_dim` — they
+share one in-memory copy of the model. Pass `--no-encoder-lock` to
+the container CMD if you have VRAM headroom and want concurrent
+encode throughput (default is on; cost is small because both servers
+already hand the encoder off to `asyncio.to_thread`).
+
+### Lab-only stdio (single-server)
+
+`scripts/docker_serve_mcp.sh` spawns ONLY the lab-corpus server
+bridged to stdio. Use this when you don't need arxiv-radar in the
+same container, or when you want the stdio transport (Claude Desktop)
+without an HTTP backend at all:
 
 ```json
 {

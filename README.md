@@ -65,7 +65,8 @@ lab-corpus-mcp/
 ├── radar.example.toml          # config template
 ├── scripts/                    # docker_*.sh wrappers (build, serve, model fetch)
 ├── src/lab_corpus_mcp/
-│   ├── __main__.py             # CLI: stdio (default) / --transport http / --remote
+│   ├── __main__.py             # CLI: single (stdio/http) / combined / remote-proxy
+│   ├── combined.py             # supervisor: arxiv-radar + lab-corpus, shared Encoder
 │   ├── config.py               # LabConfig: embeddings + parse + server
 │   ├── corpus.py               # LabPaper schema + paper_id derivation + on-disk loader
 │   ├── ingest.py               # MinerU subprocess wrapper + ingest_one / ingest_dir
@@ -95,6 +96,34 @@ arxiv-id pattern (`\d{4}\.\d{4,5}`) wins on filename; otherwise sha256
 prefix of the file bytes. Explicit `paper_id` arg to `ingest_pdf`
 overrides both.
 
+## Combined mode — both backends on one Qwen
+
+Running arxiv-radar-mcp + lab-corpus-mcp as separate containers on a
+12 GB GPU doesn't fit (Qwen3-Embedding-4B ≈ 8 GB in bf16 each → 16 GB
+total). The combined supervisor in `lab_corpus_mcp.combined` boots
+both servers in one process, hands them the same `Encoder` instance,
+and serializes encode calls with a `threading.Lock` so peak VRAM
+stays at ~10 GB (weights + one batch's activations).
+
+```bash
+# On gomer, with both radar.toml configs in place:
+bash scripts/docker_serve_combined.sh \
+    /srv/arxiv-radar/radar.toml \
+    /srv/lab-corpus/radar.toml \
+    /srv/arxiv-radar/data \
+    /srv/arxiv-radar/cache \
+    /srv/lab-corpus/cache
+
+# → arxiv-radar HTTP backend on  :8765
+# → lab-corpus  HTTP backend on  :8766
+# Two MCP proxies on the host can connect independently.
+```
+
+The supervisor refuses to start if the two configs disagree on
+`[embeddings].model` or `target_dim` — they share one in-memory
+copy. Disable the encode-call lock with `--no-encoder-lock` if you
+have VRAM headroom and want concurrent encode throughput.
+
 ## Status
 
 - **Phase 1.5 done (2026-05-09)** in arxiv-radar-mcp — `corpus_core.mcp_scaffold`
@@ -104,6 +133,10 @@ overrides both.
   delegate to `corpus_core.corpus_index`. Test suite 99% coverage. Real
   MinerU runs only inside the Docker image on gomer; tests stub the
   subprocess via the `MineruRunner` injection seam.
+- **Phase 2C done (2026-05-09):** combined-mode supervisor — one
+  container, two HTTP backends, one Qwen instance. Default `CMD` of
+  the lab-corpus-gpu image is now `combined`; lab-only single-server
+  remains available as `mcp` arg.
 - **Phase 2B+ (deferred):** PDF-content DOI extraction (currently filename
   arxiv-id or sha256 prefix), slide / video loaders.
 

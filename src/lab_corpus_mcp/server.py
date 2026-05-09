@@ -74,6 +74,7 @@ class LabCorpusServer:
         self,
         config: Config,
         *,
+        encoder: Encoder | None = None,
         mineru_runner: MineruRunner | None = None,
     ) -> None:
         self.config = config
@@ -82,7 +83,11 @@ class LabCorpusServer:
         self.mineru_runner = mineru_runner
 
         self.papers: dict[str, LabPaper] = load_lab_papers(self.parse_dir)
-        self.encoder = Encoder(config)  # lazy weight load
+        # Encoder injection point: combined-server supervisor passes one
+        # shared Encoder so arxiv-radar + lab-corpus reuse a single
+        # Qwen3-4B copy in VRAM (see lab_corpus_mcp.combined). Standalone
+        # callers omit it and we construct our own (lazy weight load).
+        self.encoder = encoder if encoder is not None else Encoder(config)
         self.jobs = JobRegistry(cache_dir=self.index_dir.parent)
 
         self.fulltext_index: EmbeddingIndex | None = None

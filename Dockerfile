@@ -58,5 +58,13 @@ WORKDIR /workspace
 #   /data                    — corpus shards, parsed PDFs, radar.toml
 VOLUME ["/root/.cache/huggingface", "/root/.cache/modelscope", "/cache", "/data"]
 
+# Combined mode: arxiv-radar (8765) + lab-corpus (8766) on one shared
+# Qwen3-4B encoder. Two MCP proxies on the host can connect to the
+# different ports; one Qwen instance fits in 12 GB VRAM.
+EXPOSE 8765 8766
+
 ENTRYPOINT ["lab-corpus-entrypoint"]
-CMD ["mcp"]
+# Default: combined mode (both backends, shared encoder). Override to
+# `mcp` for lab-only single-server stdio, or `arxiv-radar` for
+# arxiv-only HTTP backend without lab.
+CMD ["combined"]
