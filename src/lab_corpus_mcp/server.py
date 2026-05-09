@@ -227,23 +227,36 @@ class LabCorpusServer:
 
     # ----- async admin -----------------------------------------------------
 
-    def ingest_pdf(self, pdf_path: str, paper_id: str | None = None) -> dict:
-        """Submit a background ingest job for one file. Returns {job_id}."""
+    def ingest_pdf(self, pdf_path: str, paper_id: str | None = None,
+                   backend: str | None = None) -> dict:
+        """Submit a background ingest job for one file. Returns {job_id}.
+
+        `backend` selects MinerU mode (`pipeline` default — fast on
+        12 GB GPU; `vlm-transformers` for higher fidelity if you have
+        24 GB+ headroom). Omit to use ingest.DEFAULT_BACKEND.
+        """
         p = Path(pdf_path)
         if not p.exists():
             return {"error": f"file not found: {pdf_path}"}
+        from lab_corpus_mcp.ingest import DEFAULT_BACKEND
+        backend_eff = backend or DEFAULT_BACKEND
         job_id = self.jobs.submit(
             kind="ingest_pdf",
-            fn=lambda h: self._do_ingest_one(h, p, paper_id),
-            args={"pdf_path": str(p), "paper_id": paper_id},
+            fn=lambda h: self._do_ingest_one(h, p, paper_id, backend_eff),
+            args={"pdf_path": str(p), "paper_id": paper_id, "backend": backend_eff},
             n_total=1,
         )
-        return {"job_id": job_id, "kind": "ingest_pdf"}
+        return {"job_id": job_id, "kind": "ingest_pdf", "backend": backend_eff}
 
     def ingest_local_dir(self, dir_path: str,
                          glob: str = "*.pdf",
-                         recursive: bool = False) -> dict:
-        """Submit a background bulk-ingest job. Returns {job_id, n_total}."""
+                         recursive: bool = False,
+                         backend: str | None = None) -> dict:
+        """Submit a background bulk-ingest job. Returns {job_id, n_total}.
+
+        `backend` is forwarded to each per-file MinerU run; see
+        ingest_pdf for the trade-off.
+        """
         d = Path(dir_path)
         if not d.exists() or not d.is_dir():
             return {"error": f"directory not found: {dir_path}"}
@@ -253,13 +266,17 @@ class LabCorpusServer:
         if n_total == 0:
             return {"error": f"no files matching {glob!r} in {dir_path}"}
 
+        from lab_corpus_mcp.ingest import DEFAULT_BACKEND
+        backend_eff = backend or DEFAULT_BACKEND
         job_id = self.jobs.submit(
             kind="ingest_local_dir",
-            fn=lambda h: self._do_ingest_dir(h, d, glob, recursive),
-            args={"dir_path": str(d), "glob": glob, "recursive": recursive},
+            fn=lambda h: self._do_ingest_dir(h, d, glob, recursive, backend_eff),
+            args={"dir_path": str(d), "glob": glob, "recursive": recursive,
+                  "backend": backend_eff},
             n_total=n_total,
         )
-        return {"job_id": job_id, "kind": "ingest_local_dir", "n_total": n_total}
+        return {"job_id": job_id, "kind": "ingest_local_dir",
+                "n_total": n_total, "backend": backend_eff}
 
     def rebuild_index(self, force_full: bool = False) -> dict:
         """Submit a background reindex of the parsed-corpus tree."""
@@ -296,10 +313,11 @@ class LabCorpusServer:
     # ----- job workers (called by JobRegistry on a worker thread) ----------
 
     def _do_ingest_one(self, handle: JobHandle, input_file: Path,
-                       paper_id: str | None) -> dict:
+                       paper_id: str | None, backend: str) -> dict:
         try:
             paper = ingest_one(input_file, self.parse_dir,
-                               paper_id=paper_id, runner=self.mineru_runner)
+                               paper_id=paper_id, backend=backend,
+                               runner=self.mineru_runner)
         except IngestError as e:
             raise JobError(str(e)) from e
         # Refresh in-memory papers so corpus_stats / list_corpus see the new file.
@@ -309,11 +327,11 @@ class LabCorpusServer:
                 "title": paper.title, "source_kind": paper.source_kind}
 
     def _do_ingest_dir(self, handle: JobHandle, dir_path: Path,
-                       glob: str, recursive: bool) -> dict:
+                       glob: str, recursive: bool, backend: str) -> dict:
         try:
             result = ingest_dir(
                 dir_path, self.parse_dir,
-                glob=glob, recursive=recursive,
+                glob=glob, recursive=recursive, backend=backend,
                 runner=self.mineru_runner,
                 progress_cb=lambda done, total: handle.update(
                     n_done=done, n_total=total),
@@ -436,7 +454,10 @@ LAB_TOOL_SPECS: list[dict[str, Any]] = [
             "returns {job_id} immediately; poll with job_status. The file "
             "extension determines the parse path (PDF/DOCX/PPTX/image all "
             "supported by MinerU). `paper_id` overrides the auto-derived id "
-            "(useful when you already know a DOI / arxiv id)."
+            "(useful when you already know a DOI / arxiv id). `backend` "
+            "selects MinerU mode: `pipeline` (default — fast, ~90 sec for "
+            "a 2 MB PDF on RTX 4070) or `vlm-transformers` (1.2B Qwen2-VL, "
+            "higher fidelity but needs 24 GB+ GPU)."
         ),
         "inputSchema": {
             "type": "object",
@@ -450,6 +471,11 @@ LAB_TOOL_SPECS: list[dict[str, Any]] = [
                     "description": "Optional explicit id. Defaults to "
                                    "filename-arxiv-id or sha256 prefix.",
                 },
+                "backend": {
+                    "type": "string",
+                    "enum": ["pipeline", "vlm-transformers"],
+                    "description": "MinerU backend (default: pipeline).",
+                },
             },
             "required": ["pdf_path"],
         },
@@ -460,7 +486,8 @@ LAB_TOOL_SPECS: list[dict[str, Any]] = [
             "Submit a bulk MinerU ingest of every matching file in a "
             "directory. Returns {job_id, n_total} immediately. Glob defaults "
             "to `*.pdf`; pass `*.docx` / `*.pptx` / `*` etc. for other types. "
-            "`recursive=true` walks subdirectories."
+            "`recursive=true` walks subdirectories. `backend` is forwarded "
+            "to each per-file MinerU run; see ingest_pdf for the trade-off."
         ),
         "inputSchema": {
             "type": "object",
@@ -468,6 +495,11 @@ LAB_TOOL_SPECS: list[dict[str, Any]] = [
                 "dir_path": {"type": "string"},
                 "glob": {"type": "string", "default": "*.pdf"},
                 "recursive": {"type": "boolean", "default": False},
+                "backend": {
+                    "type": "string",
+                    "enum": ["pipeline", "vlm-transformers"],
+                    "description": "MinerU backend (default: pipeline).",
+                },
             },
             "required": ["dir_path"],
         },

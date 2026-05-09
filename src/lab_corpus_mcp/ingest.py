@@ -46,15 +46,28 @@ class IngestError(RuntimeError):
 MineruRunner = Callable[[Path, Path, int], Path]
 """Signature: (input_file, output_dir, timeout_seconds) -> path-to-produced-markdown."""
 
+# Default MinerU backend. `pipeline` (layout CNN + OCR + table) is what
+# we actually want on a 12 GB GPU — finishes a 2 MB PDF in ~90 sec on
+# RTX 4070. The alternative `vlm-transformers` runs MinerU's 1.2B Qwen2-VL
+# without vllm, which OOMs / wedges next to our shared Qwen3-Embedding-4B
+# (>15 min for the same input, no completion seen in a 15 min smoke).
+# Override per-call by passing `backend="vlm-transformers"` if you have
+# a 24 GB+ GPU and want the higher-fidelity output.
+DEFAULT_BACKEND = "pipeline"
 
-def _default_mineru_runner(input_file: Path, output_dir: Path, timeout: int) -> Path:
+
+def _default_mineru_runner(
+    input_file: Path, output_dir: Path, timeout: int,
+    *, backend: str = DEFAULT_BACKEND,
+) -> Path:
     """Real MinerU subprocess wrapper. Returns the produced markdown path.
 
     MinerU 2.x writes to `<output_dir>/<stem>/auto/<stem>.md` plus
     `<output_dir>/<stem>/auto/images/`. We probe that path first, then
     fall back to a recursive search to absorb minor layout drifts.
     """
-    cmd = ["mineru", "-p", str(input_file), "-o", str(output_dir)]
+    cmd = ["mineru", "-p", str(input_file), "-o", str(output_dir),
+           "-b", backend]
     LOG.info(f"mineru: {' '.join(cmd)}")
     proc = subprocess.run(
         cmd, capture_output=True, text=True, timeout=timeout, check=False,
@@ -78,16 +91,22 @@ def _default_mineru_runner(input_file: Path, output_dir: Path, timeout: int) -> 
 
 def run_mineru(
     input_file: Path, output_dir: Path, *, timeout: int = 600,
+    backend: str = DEFAULT_BACKEND,
     runner: MineruRunner | None = None,
 ) -> Path:
-    """Public entry point — uses `_default_mineru_runner` unless overridden.
+    """Public entry point. When `runner=None` (the common case), invokes
+    `_default_mineru_runner` with the chosen `backend` flag.
 
-    `runner` injection point is used by tests + the future
-    "swap MinerU for marker" benchmark in the U7 deferred work.
+    `runner` injection point is used by tests (no real MinerU subprocess)
+    and the future "swap MinerU for marker" benchmark in the U7 deferred
+    work. When a custom runner is provided, `backend` is ignored — the
+    caller's runner controls flag selection.
     """
-    runner = runner or _default_mineru_runner
     output_dir.mkdir(parents=True, exist_ok=True)
-    return runner(input_file, output_dir, timeout)
+    if runner is not None:
+        return runner(input_file, output_dir, timeout)
+    return _default_mineru_runner(input_file, output_dir, timeout,
+                                  backend=backend)
 
 
 def _copy_figures(produced_md: Path, target: Path) -> bool:
@@ -109,9 +128,17 @@ def ingest_one(
     *,
     paper_id: str | None = None,
     timeout: int = 600,
+    backend: str = DEFAULT_BACKEND,
     runner: MineruRunner | None = None,
 ) -> LabPaper:
-    """Ingest one document. Returns the persisted `LabPaper` metadata."""
+    """Ingest one document. Returns the persisted `LabPaper` metadata.
+
+    `backend` selects the MinerU pipeline (`pipeline` for layout-CNN +
+    OCR, `vlm-transformers` for the 1.2B Qwen2-VL backend). Defaults to
+    `pipeline` because the VLM backend OOMs / wedges on a 12 GB GPU
+    when sharing VRAM with our Qwen3-Embedding-4B encoder. Ignored if
+    `runner` is supplied.
+    """
     if not input_file.exists():
         raise IngestError(f"input not found: {input_file}")
 
@@ -126,7 +153,8 @@ def ingest_one(
 
     with tempfile.TemporaryDirectory() as td:
         tmp_out = Path(td)
-        produced_md = run_mineru(input_file, tmp_out, timeout=timeout, runner=runner)
+        produced_md = run_mineru(input_file, tmp_out, timeout=timeout,
+                                 backend=backend, runner=runner)
         markdown = produced_md.read_text(encoding="utf-8")
 
         figures_dir = figures_root / paper_id
@@ -162,10 +190,15 @@ def ingest_dir(
     glob: str = "*.pdf",
     recursive: bool = False,
     timeout: int = 600,
+    backend: str = DEFAULT_BACKEND,
     runner: MineruRunner | None = None,
     progress_cb: Callable[[int, int], None] | None = None,
 ) -> dict:
-    """Bulk ingest. Returns aggregate `{n_total, n_ok, n_failed, ok, failed}`."""
+    """Bulk ingest. Returns aggregate `{n_total, n_ok, n_failed, ok, failed}`.
+
+    `backend` is forwarded to each per-file ingest_one call; see that
+    function's docstring for the pipeline-vs-VLM trade-off.
+    """
     if not dir_path.exists() or not dir_path.is_dir():
         raise IngestError(f"directory not found: {dir_path}")
 
@@ -176,7 +209,8 @@ def ingest_dir(
     failed: list[dict] = []
     for i, inp in enumerate(inputs):
         try:
-            paper = ingest_one(inp, parse_dir, timeout=timeout, runner=runner)
+            paper = ingest_one(inp, parse_dir, timeout=timeout,
+                               backend=backend, runner=runner)
             ok.append({
                 "input": str(inp),
                 "paper_id": paper.paper_id,
