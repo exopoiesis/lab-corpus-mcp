@@ -67,19 +67,45 @@ lab-corpus-mcp/
 ├── src/lab_corpus_mcp/
 │   ├── __main__.py             # CLI: stdio (default) / --transport http / --remote
 │   ├── config.py               # LabConfig: embeddings + parse + server
+│   ├── corpus.py               # LabPaper schema + paper_id derivation + on-disk loader
+│   ├── ingest.py               # MinerU subprocess wrapper + ingest_one / ingest_dir
 │   └── server.py               # LabCorpusServer + LAB_TOOL_SPECS + serve/serve_http
-├── tests/
+├── tests/                      # pytest suite, 99% coverage on lab_corpus_mcp
 └── tmp/                        # local-iteration helpers (install_mineru.sh, …)
 ```
 
+## Tool surface (Phase 2B, 11 tools)
+
+| Tool | Phase | Notes |
+|------|-------|-------|
+| `corpus_stats` | 2A | parsed / indexed / chunks + last ingest |
+| `list_corpus` | 2A | paper rows newest-ingest-first, `limit` arg |
+| `paper_info` | 2B | full LabPaper + indexed status |
+| `job_status` / `job_list` | 2A | delegate to `corpus_core.JobRegistry` |
+| `ingest_pdf` | 2B-1 | async; MinerU on one file (PDF/DOCX/PPTX/image) |
+| `ingest_local_dir` | 2B-1 | async; bulk ingest by glob, optional recursion |
+| `rebuild_index` | 2B-2 | async; delegates to `corpus_core.corpus_index.reindex` |
+| `search_paper_text` | 2B-2 | substring AND-scan over chunks |
+| `search_paper_semantic` | 2B-2 | cosine over chunk embeddings (Qwen3-4B-native default) |
+| `similar_to_paper` | 2B-2 | nearest-neighbour by mean-of-chunks |
+
+`paper_id` ∈ {DOI, sha256-of-file, arxiv_id-from-filename, user-supplied},
+distinguished by `paper_id_kind` in the `LabPaper` metadata sidecar.
+arxiv-id pattern (`\d{4}\.\d{4,5}`) wins on filename; otherwise sha256
+prefix of the file bytes. Explicit `paper_id` arg to `ingest_pdf`
+overrides both.
+
 ## Status
 
-- **Phase 2A done (2026-05-09):** own MCP server on `corpus_core.mcp_scaffold`
-  (no more pass-through to `arxiv_radar_mcp.__main__`). Skeleton tool
-  surface: `corpus_stats`, `list_corpus`, `job_status`, `job_list`.
-- **Phase 2B (next):** MinerU-driven `ingest_pdf` / `ingest_local_dir`,
-  then `corpus_core.corpus_index.reindex` over the parsed tree.
-- **Phase 2B+:** `search_paper_*` and slide / video loaders.
+- **Phase 1.5 done (2026-05-09)** in arxiv-radar-mcp — `corpus_core.mcp_scaffold`
+  extracted (commit `4eb5670`).
+- **Phase 2A done (2026-05-09):** own MCP server on `corpus_core.mcp_scaffold`.
+- **Phase 2B done (2026-05-09):** MinerU ingest + reindex + chunk search
+  delegate to `corpus_core.corpus_index`. Test suite 99% coverage. Real
+  MinerU runs only inside the Docker image on gomer; tests stub the
+  subprocess via the `MineruRunner` injection seam.
+- **Phase 2B+ (deferred):** PDF-content DOI extraction (currently filename
+  arxiv-id or sha256 prefix), slide / video loaders.
 
 ## License
 

@@ -17,8 +17,8 @@ def test_build_mcp_app_uses_lab_tool_specs(lab_config):
     try:
         app = _build_mcp_app(srv)
         assert app is not None
-        # 4 = corpus_stats + list_corpus + job_status + job_list (Phase 2A)
-        assert len(LAB_TOOL_SPECS) == 4
+        # 11 tools after Phase 2B: 5 stats/admin + 2 ingest + 4 index/search.
+        assert len(LAB_TOOL_SPECS) == 11
     finally:
         srv.jobs.shutdown()
 

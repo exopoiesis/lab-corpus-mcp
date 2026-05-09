@@ -1,14 +1,15 @@
 """Tool catalogue + dispatcher + LabCorpusServer tests.
 
-Adapted from arxiv-radar-mcp/tests/test_server.py. Exercises the parts
-of `lab_corpus_mcp.server` that are pure / sync — no MCP SDK runtime,
-no stdio, no encoder loading. The async transport is left to integration
-testing once the server runs against a real client.
+Adapted from arxiv-radar-mcp/tests/test_server.py; covers Phase 2A
+skeleton + Phase 2B-1 ingest + Phase 2B-2 search/index plumbing. The
+heavy paths (real MinerU subprocess, real Encoder weights) are stubbed
+out via fixtures so the suite stays fast and dependency-light.
 """
 from __future__ import annotations
 
 import inspect
 import time
+from pathlib import Path
 
 import pytest
 
@@ -19,16 +20,19 @@ from lab_corpus_mcp.server import (
     _dispatch,
     _lab_background_tasks,
     _tool_names,
+    _warmup_encoder,
 )
 
 
 # ----- LAB_TOOL_SPECS shape --------------------------------------------------
 
 EXPECTED_TOOLS = {
-    "corpus_stats",
-    "list_corpus",
-    "job_status",
-    "job_list",
+    # Phase 2A skeleton + paper_info
+    "corpus_stats", "list_corpus", "paper_info", "job_status", "job_list",
+    # Phase 2B-1 ingest
+    "ingest_pdf", "ingest_local_dir",
+    # Phase 2B-2 index + search
+    "rebuild_index", "search_paper_text", "search_paper_semantic", "similar_to_paper",
 }
 
 
@@ -39,7 +43,6 @@ def test_tool_specs_cover_all_expected_tools():
 
 
 def test_tool_specs_match_method_signatures():
-    """Every tool's required-args + declared properties must be real method params."""
     for spec in LAB_TOOL_SPECS:
         method = getattr(LabCorpusServer, spec["name"])
         sig = inspect.signature(method)
@@ -60,12 +63,10 @@ def test_tool_specs_have_descriptions_and_object_schema():
 
 
 def test_no_arxiv_radar_tools_leak_through():
-    """Lab catalogue must not silently inherit arxiv-radar's tool surface."""
     listed = {s["name"] for s in LAB_TOOL_SPECS}
     forbidden = {
         "search_abstract_text", "search_abstract_semantic", "similar_to_abstract",
-        "paper_info", "list_tags", "list_domains",
-        "search_paper_text", "search_paper_semantic", "similar_to_paper",
+        "list_tags", "list_domains",
         "fetch_papers", "reindex", "refresh_abstracts", "validate_arxiv_ids",
         "list_enriched",
     }
@@ -75,7 +76,7 @@ def test_no_arxiv_radar_tools_leak_through():
 
 def test_tool_names_helper_matches_specs():
     assert set(_tool_names()) == EXPECTED_TOOLS
-    assert len(_tool_names()) == len(LAB_TOOL_SPECS)
+    assert len(_tool_names()) == len(LAB_TOOL_SPECS) == 11
 
 
 # ----- _dispatch -------------------------------------------------------------
@@ -87,13 +88,35 @@ class _StubLab:
         return {"called": "corpus_stats", "n_parsed": 0}
 
     def list_corpus(self, limit=None):
-        return ["a", "b"] if limit is None else ["a", "b"][:limit]
+        return [{"paper_id": "x"}] if limit != 0 else []
+
+    def paper_info(self, paper_id):
+        return {"paper_id": paper_id}
 
     def job_status(self, job_id):
-        return {"called": "job_status", "job_id": job_id}
+        return {"job_id": job_id}
 
     def job_list(self, limit=50):
         return [{"limit": limit}]
+
+    def ingest_pdf(self, pdf_path, paper_id=None):
+        return {"called": "ingest_pdf", "pdf": pdf_path, "id": paper_id}
+
+    def ingest_local_dir(self, dir_path, glob="*.pdf", recursive=False):
+        return {"called": "ingest_local_dir", "dir": dir_path, "glob": glob,
+                "recursive": recursive}
+
+    def rebuild_index(self, force_full=False):
+        return {"called": "rebuild_index", "force_full": force_full}
+
+    def search_paper_text(self, query, k=10, snippet_chars=240):
+        return [{"q": query, "k": k}]
+
+    def search_paper_semantic(self, query, k=10, snippet_chars=240):
+        return [{"q": query, "k": k, "kind": "semantic"}]
+
+    def similar_to_paper(self, paper_id, k=10):
+        return [{"to": paper_id, "k": k}]
 
 
 def test_dispatch_routes_to_method():
@@ -107,8 +130,10 @@ def test_dispatch_handles_none_arguments():
 
 
 def test_dispatch_passes_kwargs_through():
-    out = _dispatch(_StubLab(), "list_corpus", {"limit": 1})
-    assert out == ["a"]
+    out = _dispatch(_StubLab(), "ingest_local_dir",
+                    {"dir_path": "/x", "glob": "*.pdf", "recursive": True})
+    assert out == {"called": "ingest_local_dir", "dir": "/x",
+                   "glob": "*.pdf", "recursive": True}
 
 
 def test_dispatch_unknown_tool_returns_error():
@@ -122,25 +147,30 @@ def test_dispatch_rejects_dunder_or_private_names():
 
 
 def test_dispatch_bad_arguments_returns_error():
-    out = _dispatch(_StubLab(), "job_status", {"wrong_kw": "x"})
-    assert "error" in out and "job_status" in out["error"]
+    out = _dispatch(_StubLab(), "paper_info", {"wrong_kw": "x"})
+    assert "error" in out and "paper_info" in out["error"]
 
 
 def test_dispatch_rejects_arxiv_only_tool_names():
-    """Arxiv-radar's tool names must not silently pass through dispatch."""
-    for name in ("search_abstract_text", "fetch_papers", "paper_info"):
+    for name in ("search_abstract_text", "fetch_papers", "list_domains"):
         out = _dispatch(_StubLab(), name, {})
         assert "error" in out, f"{name} unexpectedly accepted"
 
 
+def test_dispatch_routes_to_search_methods():
+    out = _dispatch(_StubLab(), "search_paper_semantic", {"query": "dft"})
+    assert out == [{"q": "dft", "k": 10, "kind": "semantic"}]
+
+
 # ----- LabCorpusServer end-to-end --------------------------------------------
 
-def test_init_without_index_sets_corpus_index_none(lab_config):
+def test_init_without_index_sets_fulltext_index_none(lab_config):
     srv = LabCorpusServer(lab_config)
     try:
-        assert srv.corpus_index is None
+        assert srv.fulltext_index is None
         assert srv.parse_dir == lab_config.parse.dir
         assert srv.index_dir == lab_config.embeddings.cache_dir
+        assert srv.papers == {}
     finally:
         srv.jobs.shutdown()
 
@@ -149,23 +179,23 @@ class _FakeIndex:
     """Stand-in for EmbeddingIndex used to exercise the loaded-index path."""
 
     def __init__(self, *, n_chunks: int, n_papers: int, model_name: str):
-        # Minimum surface LabCorpusServer touches: matrix.shape, model_name, metadata.
         class _M:
             shape = (n_chunks, 1024)
         self.matrix = _M()
         self.model_name = model_name
+        self.dims = 1024
         self.metadata = {
+            "n_papers": n_papers,
             "chunks": [
-                {"arxiv_id": f"paper-{i % n_papers:03d}", "chunk_idx": i}
+                {"arxiv_id": f"paper-{i % n_papers:03d}",
+                 "section": f"sec-{i}",
+                 "chunk_idx": i}
                 for i in range(n_chunks)
             ],
         }
 
 
 def test_init_with_existing_index_loads_metadata(monkeypatch, lab_config):
-    """When an EmbeddingIndex is on disk, LabCorpusServer should load it
-    and corpus_stats should reflect its metadata. Mocks EmbeddingIndex.load
-    to avoid building a real on-disk index."""
     fake = _FakeIndex(n_chunks=12, n_papers=4, model_name="test/dummy")
     monkeypatch.setattr(
         "lab_corpus_mcp.server.EmbeddingIndex.load",
@@ -174,13 +204,29 @@ def test_init_with_existing_index_loads_metadata(monkeypatch, lab_config):
 
     srv = LabCorpusServer(lab_config)
     try:
-        assert srv.corpus_index is fake
+        assert srv.fulltext_index is fake
         out = srv.corpus_stats()
         assert out["n_chunks"] == 12
-        assert out["n_indexed"] == 4   # distinct arxiv_ids in metadata
+        assert out["n_indexed"] == 4
     finally:
         srv.jobs.shutdown()
 
+
+def test_init_warns_on_model_mismatch(monkeypatch, lab_config, caplog):
+    fake = _FakeIndex(n_chunks=2, n_papers=1, model_name="other/model")
+    monkeypatch.setattr(
+        "lab_corpus_mcp.server.EmbeddingIndex.load",
+        classmethod(lambda cls, _path: fake),
+    )
+    with caplog.at_level("WARNING"):
+        srv = LabCorpusServer(lab_config)
+        try:
+            assert any("force_full=true" in rec.message for rec in caplog.records)
+        finally:
+            srv.jobs.shutdown()
+
+
+# ----- corpus_stats / list_corpus / paper_info -------------------------------
 
 def test_corpus_stats_empty_corpus(lab_config):
     srv = LabCorpusServer(lab_config)
@@ -188,9 +234,8 @@ def test_corpus_stats_empty_corpus(lab_config):
         out = srv.corpus_stats()
         assert out["n_parsed"] == 0
         assert out["n_indexed"] == 0
-        assert out["n_chunks"] == 0
+        assert out["last_ingest_at"] is None
         assert out["embedding_model"] == lab_config.embeddings.model
-        assert out["parse_dir"] == str(lab_config.parse.dir)
     finally:
         srv.jobs.shutdown()
 
@@ -200,9 +245,8 @@ def test_corpus_stats_counts_parsed_files(lab_config, populated_parse_dir):
     try:
         out = srv.corpus_stats()
         assert out["n_parsed"] == 3
-        # No index built → still 0 indexed/0 chunks.
         assert out["n_indexed"] == 0
-        assert out["n_chunks"] == 0
+        assert out["last_ingest_at"] == "2026-05-09T10:02:00+00:00"
     finally:
         srv.jobs.shutdown()
 
@@ -215,12 +259,14 @@ def test_list_corpus_empty(lab_config):
         srv.jobs.shutdown()
 
 
-def test_list_corpus_sorted_by_id(lab_config, populated_parse_dir):
+def test_list_corpus_newest_first_with_metadata(lab_config, populated_parse_dir):
     srv = LabCorpusServer(lab_config)
     try:
-        ids = srv.list_corpus()
-        # Lex-sorted: "doi-..." < "paper-001" < "paper-002"
-        assert ids == ["doi-10.1000-zzz", "paper-001", "paper-002"]
+        rows = srv.list_corpus()
+        ids = [r["paper_id"] for r in rows]
+        # ingested_at desc → paper-002 (10:02) > paper-001 (10:01) > doi-... (10:00)
+        assert ids == ["paper-002", "paper-001", "doi-10.1000-zzz"]
+        assert all("title" in r and "source_kind" in r for r in rows)
     finally:
         srv.jobs.shutdown()
 
@@ -228,115 +274,440 @@ def test_list_corpus_sorted_by_id(lab_config, populated_parse_dir):
 def test_list_corpus_respects_limit(lab_config, populated_parse_dir):
     srv = LabCorpusServer(lab_config)
     try:
-        assert srv.list_corpus(limit=2) == ["doi-10.1000-zzz", "paper-001"]
+        assert len(srv.list_corpus(limit=2)) == 2
         assert srv.list_corpus(limit=0) == []
     finally:
         srv.jobs.shutdown()
 
 
-def test_list_corpus_via_dispatch(lab_config, populated_parse_dir):
+def test_paper_info_unknown(lab_config):
     srv = LabCorpusServer(lab_config)
     try:
-        out = _dispatch(srv, "list_corpus", {"limit": 1})
-        assert out == ["doi-10.1000-zzz"]
-    finally:
-        srv.jobs.shutdown()
-
-
-def test_corpus_stats_via_dispatch(lab_config, populated_parse_dir):
-    srv = LabCorpusServer(lab_config)
-    try:
-        out = _dispatch(srv, "corpus_stats", {})
-        assert out["n_parsed"] == 3
-    finally:
-        srv.jobs.shutdown()
-
-
-def test_job_status_unknown_id(lab_config):
-    srv = LabCorpusServer(lab_config)
-    try:
-        out = srv.job_status("nonexistent")
+        out = srv.paper_info("nonexistent")
         assert "error" in out and "nonexistent" in out["error"]
     finally:
         srv.jobs.shutdown()
 
 
-def test_job_list_empty(lab_config):
+def test_paper_info_returns_metadata(lab_config, populated_parse_dir):
     srv = LabCorpusServer(lab_config)
     try:
-        assert srv.job_list() == []
+        out = srv.paper_info("paper-001")
+        assert out["paper_id"] == "paper-001"
+        assert out["title"] == "First"
+        assert out["source_kind"] == "pdf"
+        assert out["indexed"] is False  # no index built
     finally:
         srv.jobs.shutdown()
 
 
-def test_job_list_returns_recent_jobs(lab_config):
-    """Submit a no-op job, wait briefly, verify it shows up in job_list."""
+def test_paper_info_reflects_index_when_loaded(monkeypatch, lab_config, populated_parse_dir):
+    fake = _FakeIndex(n_chunks=6, n_papers=3, model_name=lab_config.embeddings.model)
+    # Wire the fake's chunks to use one of our populated paper ids.
+    fake.metadata["chunks"] = [
+        {"arxiv_id": "paper-001", "section": "Introduction", "chunk_idx": 0},
+        {"arxiv_id": "paper-001", "section": "Methods", "chunk_idx": 1},
+        {"arxiv_id": "paper-002", "section": "Results", "chunk_idx": 0},
+    ]
+    monkeypatch.setattr(
+        "lab_corpus_mcp.server.EmbeddingIndex.load",
+        classmethod(lambda cls, _path: fake),
+    )
     srv = LabCorpusServer(lab_config)
     try:
-        job_id = srv.jobs.submit(
-            kind="smoke",
-            fn=lambda h: {"ok": True},
-            args={},
-            n_total=1,
-        )
-        # Tiny poll loop (≤1 s) — the worker pool runs the lambda promptly.
-        for _ in range(50):
-            info = srv.job_status(job_id)
-            if info.get("state") in ("done", "failed"):
-                break
-            time.sleep(0.02)
+        out = srv.paper_info("paper-001")
+        assert out["indexed"] is True
+        assert out["n_chunks"] == 2
+    finally:
+        srv.jobs.shutdown()
 
+
+# ----- ingest_pdf / ingest_local_dir -----------------------------------------
+
+def _wait_for_terminal(srv, job_id, timeout=2.0):
+    deadline = time.time() + timeout
+    while time.time() < deadline:
         info = srv.job_status(job_id)
-        assert info["state"] == "done"
-        assert info["result"] == {"ok": True}
-
-        recent = srv.job_list(limit=10)
-        assert any(j["job_id"] == job_id for j in recent)
-    finally:
-        srv.jobs.shutdown()
+        if info.get("state") in ("done", "failed"):
+            return info
+        time.sleep(0.02)
+    return srv.job_status(job_id)
 
 
-def test_job_list_respects_limit(lab_config):
+def test_ingest_pdf_missing_file(lab_config):
     srv = LabCorpusServer(lab_config)
     try:
-        for i in range(3):
-            srv.jobs.submit(
-                kind="smoke",
-                fn=lambda h, i=i: {"i": i},
-                n_total=1,
-            )
-        # Wait for everything to settle.
-        for _ in range(50):
-            recent = srv.job_list()
-            if all(j.get("state") in ("done", "failed") for j in recent):
-                break
-            time.sleep(0.02)
-
-        capped = srv.job_list(limit=2)
-        assert len(capped) <= 2
+        out = srv.ingest_pdf(pdf_path="C:/no/such/file.pdf")
+        assert "error" in out and "not found" in out["error"]
     finally:
         srv.jobs.shutdown()
 
 
-# ----- _build_mcp_app + background tasks -------------------------------------
+def test_ingest_pdf_runs_via_fake_runner(lab_config, fake_pdf, fake_mineru_runner):
+    srv = LabCorpusServer(lab_config, mineru_runner=fake_mineru_runner)
+    try:
+        result = srv.ingest_pdf(str(fake_pdf))
+        assert "job_id" in result
+        info = _wait_for_terminal(srv, result["job_id"])
+        assert info["state"] == "done", info
+        assert info["result"]["paper_id"] == "2503.99999"   # arxiv_id derivation
+        assert info["result"]["source_kind"] == "pdf"
+        # paper now visible to corpus_stats
+        assert srv.corpus_stats()["n_parsed"] == 1
+        # markdown landed on disk
+        out_md = lab_config.parse.dir / "sources" / "2503.99999.md"
+        assert out_md.exists() and out_md.read_text(encoding="utf-8")
+        # figures copied
+        figures = lab_config.parse.dir / "figures" / "2503.99999"
+        assert (figures / "fig1.png").exists()
+    finally:
+        srv.jobs.shutdown()
+
+
+def test_ingest_pdf_with_explicit_paper_id(lab_config, fake_pdf, fake_mineru_runner):
+    srv = LabCorpusServer(lab_config, mineru_runner=fake_mineru_runner)
+    try:
+        result = srv.ingest_pdf(str(fake_pdf), paper_id="my-custom-id")
+        info = _wait_for_terminal(srv, result["job_id"])
+        assert info["state"] == "done"
+        assert info["result"]["paper_id"] == "my-custom-id"
+    finally:
+        srv.jobs.shutdown()
+
+
+def test_ingest_local_dir_missing_path(lab_config):
+    srv = LabCorpusServer(lab_config)
+    try:
+        out = srv.ingest_local_dir(dir_path="C:/no/such/dir")
+        assert "error" in out and "not found" in out["error"]
+    finally:
+        srv.jobs.shutdown()
+
+
+def test_ingest_local_dir_no_matches(lab_config, tmp_path):
+    empty_dir = tmp_path / "empty"
+    empty_dir.mkdir()
+    srv = LabCorpusServer(lab_config)
+    try:
+        out = srv.ingest_local_dir(dir_path=str(empty_dir))
+        assert "error" in out and "no files matching" in out["error"]
+    finally:
+        srv.jobs.shutdown()
+
+
+def test_ingest_local_dir_bulk(lab_config, tmp_path, fake_mineru_runner):
+    bulk = tmp_path / "bulk"
+    bulk.mkdir()
+    # Distinct contents → distinct sha256 → three independent paper_ids.
+    for i in range(3):
+        (bulk / f"paper-{i:03d}.pdf").write_bytes(f"%PDF-1.4\n{i}".encode())
+
+    srv = LabCorpusServer(lab_config, mineru_runner=fake_mineru_runner)
+    try:
+        result = srv.ingest_local_dir(dir_path=str(bulk))
+        assert result["n_total"] == 3
+        info = _wait_for_terminal(srv, result["job_id"], timeout=4.0)
+        assert info["state"] == "done", info
+        assert info["result"]["n_ok"] == 3
+        assert info["result"]["n_failed"] == 0
+        # Three new papers picked up by the in-memory map.
+        assert len(srv.papers) == 3
+    finally:
+        srv.jobs.shutdown()
+
+
+# ----- rebuild_index ---------------------------------------------------------
+
+def test_rebuild_index_no_papers(lab_config):
+    srv = LabCorpusServer(lab_config)
+    try:
+        out = srv.rebuild_index()
+        assert "error" in out and "ingest_pdf" in out["error"]
+    finally:
+        srv.jobs.shutdown()
+
+
+def test_rebuild_index_lock_already_held(lab_config, populated_parse_dir):
+    srv = LabCorpusServer(lab_config)
+    try:
+        # Steal the lock — second rebuild_index should refuse.
+        assert srv.jobs.acquire_reindex_lock()
+        out = srv.rebuild_index()
+        assert "error" in out and "lockfile held" in out["error"]
+    finally:
+        srv.jobs.release_reindex_lock()
+        srv.jobs.shutdown()
+
+
+def test_rebuild_index_delegates_to_corpus_core(monkeypatch, lab_config,
+                                                populated_parse_dir):
+    """Stub `corpus_core.corpus_index.reindex` so we don't need a real Encoder."""
+    captured = {}
+    fake_index = _FakeIndex(n_chunks=4, n_papers=2,
+                            model_name=lab_config.embeddings.model)
+
+    def _fake_reindex(parse_dir, encoder, *, incremental, progress_cb=None):
+        captured["parse_dir"] = parse_dir
+        captured["incremental"] = incremental
+        if progress_cb is not None:
+            progress_cb(2, 3)
+        return fake_index
+
+    monkeypatch.setattr("lab_corpus_mcp.server.reindex", _fake_reindex)
+
+    srv = LabCorpusServer(lab_config)
+    try:
+        out = srv.rebuild_index(force_full=True)
+        assert "job_id" in out
+        info = _wait_for_terminal(srv, out["job_id"])
+        assert info["state"] == "done", info
+        assert captured["incremental"] is False
+        assert captured["parse_dir"] == lab_config.parse.dir
+        assert srv.fulltext_index is fake_index
+    finally:
+        srv.jobs.shutdown()
+
+
+# ----- search paths ----------------------------------------------------------
+
+def test_search_paper_text_no_index(lab_config):
+    srv = LabCorpusServer(lab_config)
+    try:
+        out = srv.search_paper_text("anything")
+        assert isinstance(out, list) and "error" in out[0]
+    finally:
+        srv.jobs.shutdown()
+
+
+def test_search_paper_semantic_no_index(lab_config):
+    srv = LabCorpusServer(lab_config)
+    try:
+        out = srv.search_paper_semantic("anything")
+        assert "error" in out[0]
+    finally:
+        srv.jobs.shutdown()
+
+
+def test_similar_to_paper_no_index(lab_config):
+    srv = LabCorpusServer(lab_config)
+    try:
+        out = srv.similar_to_paper("paper-001")
+        assert "error" in out[0]
+    finally:
+        srv.jobs.shutdown()
+
+
+def test_search_paper_text_via_corpus_core(monkeypatch, lab_config, populated_parse_dir):
+    """Wire fulltext_index manually and stub corpus_core.search_paper_text."""
+    fake = _FakeIndex(n_chunks=2, n_papers=1, model_name=lab_config.embeddings.model)
+    captured: dict = {}
+
+    def _fake_search(chunk_texts, chunk_meta, query, k=10, snippet_chars=240):
+        captured["query"] = query
+        captured["k"] = k
+        captured["snippet_chars"] = snippet_chars
+        return [{"hit": query}]
+
+    monkeypatch.setattr("lab_corpus_mcp.server.load_chunk_texts",
+                        lambda parse_dir, idx: ["t1", "t2"])
+    monkeypatch.setattr("lab_corpus_mcp.server.search_paper_text", _fake_search)
+
+    srv = LabCorpusServer(lab_config)
+    try:
+        srv.fulltext_index = fake
+        out = srv.search_paper_text("dft", k=3, snippet_chars=120)
+        assert out == [{"hit": "dft"}]
+        assert captured == {"query": "dft", "k": 3, "snippet_chars": 120}
+    finally:
+        srv.jobs.shutdown()
+
+
+def test_search_paper_semantic_via_corpus_core(monkeypatch, lab_config):
+    fake = _FakeIndex(n_chunks=2, n_papers=1, model_name=lab_config.embeddings.model)
+    captured: dict = {}
+
+    monkeypatch.setattr("lab_corpus_mcp.server.load_chunk_texts",
+                        lambda parse_dir, idx: ["t1"])
+    monkeypatch.setattr("lab_corpus_mcp.server.search_paper_semantic",
+                        lambda idx, texts, qvec, k=10, snippet_chars=240: [
+                            {"score": float(qvec.sum()), "k": k}
+                        ])
+
+    srv = LabCorpusServer(lab_config)
+    try:
+        # Stub encoder so we don't load real Qwen weights.
+        import numpy as np
+        srv.encoder.encode_query = lambda q: np.array([0.5, 0.5], dtype=np.float32)
+        srv.fulltext_index = fake
+        out = srv.search_paper_semantic("query", k=2)
+        assert out[0]["score"] == pytest.approx(1.0)
+        assert out[0]["k"] == 2
+    finally:
+        srv.jobs.shutdown()
+
+
+def test_similar_to_paper_via_corpus_core(monkeypatch, lab_config):
+    fake = _FakeIndex(n_chunks=2, n_papers=1, model_name=lab_config.embeddings.model)
+    monkeypatch.setattr("lab_corpus_mcp.server.similar_to_paper",
+                        lambda idx, paper_id, k=10: [{"id": paper_id, "k": k}])
+
+    srv = LabCorpusServer(lab_config)
+    try:
+        srv.fulltext_index = fake
+        out = srv.similar_to_paper("paper-001", k=4)
+        assert out == [{"id": "paper-001", "k": 4}]
+    finally:
+        srv.jobs.shutdown()
+
+
+# ----- background tasks + warmup --------------------------------------------
+
+def test_lab_background_tasks_includes_warmup(lab_config):
+    srv = LabCorpusServer(lab_config)
+    try:
+        factories = _lab_background_tasks(srv)
+        assert len(factories) == 1
+    finally:
+        srv.jobs.shutdown()
+
+
+def test_warmup_encoder_logs_and_swallows_errors(lab_config, caplog):
+    """Warm-up must not crash even when the encoder blows up — first
+    real query will retry."""
+    srv = LabCorpusServer(lab_config)
+    try:
+        def _boom(_q):
+            raise RuntimeError("simulated cuda OOM")
+        srv.encoder.encode_query = _boom
+
+        import asyncio
+        with caplog.at_level("WARNING"):
+            asyncio.run(_warmup_encoder(srv))
+        assert any("warm-up failed" in rec.message for rec in caplog.records)
+    finally:
+        srv.jobs.shutdown()
+
+
+def test_warmup_encoder_happy_path(lab_config, caplog):
+    """Successful warm-up logs 'ready' and returns cleanly."""
+    srv = LabCorpusServer(lab_config)
+    try:
+        import numpy as np
+        srv.encoder.encode_query = lambda q: np.zeros(4, dtype=np.float32)
+        import asyncio
+        with caplog.at_level("INFO"):
+            asyncio.run(_warmup_encoder(srv))
+        assert any("ready" in rec.message for rec in caplog.records)
+    finally:
+        srv.jobs.shutdown()
+
+
+# ----- job worker error paths (LabCorpusServer end-to-end) -------------------
+
+def test_job_status_real_server_unknown(lab_config):
+    srv = LabCorpusServer(lab_config)
+    try:
+        out = srv.job_status("no-such-id")
+        assert "error" in out and "no-such-id" in out["error"]
+    finally:
+        srv.jobs.shutdown()
+
+
+def test_job_list_real_server_returns_recent(lab_config, fake_pdf, fake_mineru_runner):
+    srv = LabCorpusServer(lab_config, mineru_runner=fake_mineru_runner)
+    try:
+        result = srv.ingest_pdf(str(fake_pdf))
+        _wait_for_terminal(srv, result["job_id"])
+        recent = srv.job_list(limit=10)
+        assert any(j["job_id"] == result["job_id"] for j in recent)
+    finally:
+        srv.jobs.shutdown()
+
+
+def test_ingest_pdf_runner_failure_marks_job_failed(lab_config, fake_pdf):
+    """Runner raising IngestError should make _do_ingest_one re-raise as
+    JobError so the registry records it as `failed`, not crashed."""
+    from lab_corpus_mcp.ingest import IngestError
+
+    def _boom(*a, **kw):
+        raise IngestError("simulated parse failure")
+
+    srv = LabCorpusServer(lab_config, mineru_runner=_boom)
+    try:
+        result = srv.ingest_pdf(str(fake_pdf))
+        info = _wait_for_terminal(srv, result["job_id"])
+        assert info["state"] == "failed"
+        assert "simulated parse failure" in info["error"]
+    finally:
+        srv.jobs.shutdown()
+
+
+def test_ingest_local_dir_runner_failure_marks_job_failed(lab_config, tmp_path):
+    """`ingest_dir` raising IngestError must surface through _do_ingest_dir
+    as a clean JobError (not a crash)."""
+    from lab_corpus_mcp import ingest as ing
+
+    bulk = tmp_path / "bulk"
+    bulk.mkdir()
+    (bulk / "x.pdf").write_bytes(b"%PDF-1.4")
+
+    def _ingest_dir_raises(*a, **kw):
+        raise ing.IngestError("ingest_dir blew up")
+
+    # Patch the symbol that server.py imported.
+    import lab_corpus_mcp.server as srv_mod
+
+    srv = LabCorpusServer(lab_config)
+    try:
+        original = srv_mod.ingest_dir
+        srv_mod.ingest_dir = _ingest_dir_raises
+        try:
+            result = srv.ingest_local_dir(str(bulk))
+            info = _wait_for_terminal(srv, result["job_id"])
+            assert info["state"] == "failed"
+            assert "ingest_dir blew up" in info["error"]
+        finally:
+            srv_mod.ingest_dir = original
+    finally:
+        srv.jobs.shutdown()
+
+
+def test_rebuild_index_filenotfound_becomes_joberror(monkeypatch, lab_config,
+                                                     populated_parse_dir):
+    """corpus_core.corpus_index.reindex raising FileNotFoundError must be
+    converted to JobError so the registry sees `failed`, not crashed."""
+    def _missing(*a, **kw):
+        raise FileNotFoundError("phantom cache file")
+
+    monkeypatch.setattr("lab_corpus_mcp.server.reindex", _missing)
+
+    srv = LabCorpusServer(lab_config)
+    try:
+        result = srv.rebuild_index()
+        info = _wait_for_terminal(srv, result["job_id"])
+        assert info["state"] == "failed"
+        assert "phantom cache file" in info["error"]
+    finally:
+        srv.jobs.shutdown()
+
+
+# ----- _build_mcp_app --------------------------------------------------------
 
 def test_build_mcp_app_constructs_server(lab_config):
     srv = LabCorpusServer(lab_config)
     try:
         app = _build_mcp_app(srv)
-        # We can't easily call the SDK handler without a session, but the
-        # constructor returning an object guards against signature drift.
         assert app is not None
-        assert len(LAB_TOOL_SPECS) == 4
+        assert len(LAB_TOOL_SPECS) == 11
     finally:
         srv.jobs.shutdown()
 
 
-def test_lab_background_tasks_empty_for_skeleton(lab_config):
-    """Phase 2A intentionally has no warm-up / refresh — verify so we
-    catch surprise additions before the 2B encoder warm-up lands."""
+def test_dispatch_via_real_server(lab_config, populated_parse_dir):
     srv = LabCorpusServer(lab_config)
     try:
-        assert _lab_background_tasks(srv) == []
+        out = _dispatch(srv, "list_corpus", {"limit": 1})
+        assert isinstance(out, list) and len(out) == 1
+        assert out[0]["paper_id"] == "paper-002"
     finally:
         srv.jobs.shutdown()
