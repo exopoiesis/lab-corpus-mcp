@@ -107,17 +107,20 @@ and serializes encode calls with a `threading.Lock` so peak VRAM
 stays at ~10 GB (weights + one batch's activations).
 
 ```bash
-# On gomer, with both radar.toml configs in place:
+# On gomer, with both radar.toml configs in place at the canonical
+# host paths:
 bash scripts/docker_serve_combined.sh \
     /srv/arxiv-radar/radar.toml \
     /srv/lab-corpus/radar.toml \
-    /srv/arxiv-radar/data \
+    /srv/arxiv-radar/cache/sources \
     /srv/arxiv-radar/cache \
     /srv/lab-corpus/cache
 
 # → arxiv-radar HTTP backend on  :8765
 # → lab-corpus  HTTP backend on  :8766
-# Two MCP proxies on the host can connect independently.
+# (or any host:port mapping you choose — the production deploy uses
+# 127.0.0.1:18765 / :18766 to coexist with the legacy
+# arxiv-radar-backend container on :8765 during migration.)
 ```
 
 The supervisor refuses to start if the two configs disagree on
@@ -138,6 +141,31 @@ have VRAM headroom and want concurrent encode throughput.
   container, two HTTP backends, one Qwen instance. Default `CMD` of
   the lab-corpus-gpu image is now `combined`; lab-only single-server
   remains available as `mcp` arg.
+- **Phase 3 done (2026-05-09):** `corpus_core` extracted to its own
+  repo at `git/corpus-core/`. arxiv-radar-mcp + lab-corpus-mcp
+  declare it as a regular dependency. Combined image installs all
+  three siblings editable in dep order; build-time
+  `scripts/audit_image.py` enforces the no-duplicate-distribution
+  invariant.
+- **Production deploy done (2026-05-09 → 10):** combined image built
+  on gomer (`exopoiesis/lab-corpus-gpu`, ~12 GB), supervisor running
+  on `127.0.0.1:18765` (arxiv-radar) + `127.0.0.1:18766` (lab-corpus).
+  PyTorch 2.7.1+cu126 base satisfies MinerU 3.x's `torch>=2.6,<3` —
+  no parallel torch reinstall in the image. Single Qwen3-4B in VRAM
+  (~10 GB peak) shared between both backends via `_LockedEncoder`.
+  Migrated 34,627 abstract embeddings + 466 fulltext chunks (51
+  papers) from the legacy `arxiv-radar-cache` volume into
+  `/srv/arxiv-radar/cache/`; nightly refresh runs incremental
+  (`full_rebuild=false`, `interval_hours=24`) so existing embeddings
+  are preserved.
+- **MinerU backend default = `pipeline`** (not `vlm-transformers`).
+  The 1.2B Qwen2-VL backend wedges on a 12 GB GPU when sharing
+  VRAM with our embedding Qwen; `pipeline` (layout-CNN + OCR)
+  finishes a 2 MB PDF in ~90 sec. Override per-call via
+  `backend="vlm-transformers"` if you have 24 GB+ headroom.
+  End-to-end smoke verified on arxiv:2512.14129 (Yin et al.,
+  (Cr,Fe)S pyrrhotite) — 16 chunks indexed, `search_paper_text` and
+  `search_paper_semantic` return correct hits.
 - **Phase 2B+ (deferred):** PDF-content DOI extraction (currently filename
   arxiv-id or sha256 prefix), slide / video loaders.
 

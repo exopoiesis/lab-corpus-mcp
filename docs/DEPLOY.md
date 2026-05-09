@@ -3,15 +3,18 @@
 Production deployment is a single GPU container on **gomer**, bundling
 three workflows on the same CUDA + torch stack:
 
-| Workflow | When to run | Time |
+| Workflow | When to run | Time on gomer (RTX 4070) |
 |---|---|---|
-| MinerU PDF parsing | new literature batch arrives | minutes per PDF (vlm-transformers) |
-| Embedding cache build | new corpus shards added or model swap | ~5 min per 14k papers (Qwen3-4B native) |
-| MCP server (stdio) | always-on for Claude Desktop | runs as long as a query is open |
+| MinerU PDF parsing (`pipeline` backend) | new literature batch arrives | ~60-90 sec per 2 MB PDF |
+| Reindex (chunk-level, incremental) | after ingest | ~70 sec for 16 chunks |
+| MCP server (HTTP) | always-on for clients | runs while container is up |
+| Daily refresh of arxiv shards | nightly | incremental — only new arxiv_ids re-encoded |
 
-The image bundles **MinerU + arxiv-radar-mcp + lab_corpus_mcp** in one
-go. Build context is the parent directory of both repos; see
-`scripts/docker_build.sh`.
+The image bundles **MinerU + corpus-core + arxiv-radar-mcp + lab_corpus_mcp**
+on top of `pytorch/pytorch:2.7.1-cuda12.6-cudnn9-runtime` (Python 3.11,
+torch 2.7.1+cu126, satisfies MinerU 3.x's `torch>=2.6,<3` floor without
+a parallel torch reinstall). Build context is the parent directory of
+all three sibling repos; see `scripts/docker_build.sh`.
 
 ## One-time setup
 
@@ -34,6 +37,46 @@ After this, two named docker volumes exist on gomer:
 
 These persist across container restarts so we never re-download.
 
+> **Sharing the HF volume with a legacy arxiv-radar-backend.** If you
+> already have an `arxiv-radar-backend` container on the host using
+> `arxiv-radar-hf` for its Qwen weights, point `docker_serve_combined.sh`
+> at the SAME volume name (the script accepts `-v arxiv-radar-hf:...`)
+> instead of `lab-corpus-hf`. That way Qwen3-4B weights stay at one
+> copy on the host disk during the migration window.
+
+## Migrating from a legacy arxiv-radar-backend
+
+If you have a long-running `arxiv-radar-backend` container with
+abstract/fulltext indexes already built, you can promote it to the
+combined image without re-encoding. The combined supervisor reads the
+exact same on-disk layout (`<cache_dir>/abstracts`,
+`<cache_dir>/fulltext`, `<cache_dir>/sources`).
+
+```bash
+# 1. Spin up a transient container that mounts BOTH the old volume
+#    (read-only) and the new host path:
+docker --context gomer run --rm \
+    -v arxiv-radar-cache:/src:ro \
+    -v /srv/arxiv-radar:/dst \
+    busybox sh -c '
+        mkdir -p /dst/cache
+        cp -a /src/. /dst/cache/
+    '
+
+# 2. Write the new radar.toml at /srv/arxiv-radar/radar.toml with paths
+#    rewritten to /srv/arxiv-radar/cache/* (see radar.example.toml).
+#    Set [refresh] enabled=true, full_rebuild=false so the nightly tick
+#    only encodes new shards.
+
+# 3. Boot the combined container — it loads the migrated indexes:
+#    [INFO] loaded abstract index: (34627, 2560)
+#    [INFO] loaded fulltext index: (466, 2560) (466 chunks across 51 papers)
+#    [INFO] refresh loop: every 24h, full_rebuild=False
+```
+
+After verification, stop the legacy `arxiv-radar-backend` and repoint
+your MCP clients at the combined image's two ports.
+
 ## Workflows
 
 ### Ingest PDFs (and DOCX / PPTX / images)
@@ -50,19 +93,37 @@ LabPaper sidecar per file, makes the result discoverable via
   "args": {
     "dir_path": "/data/pdfs/inbox",
     "glob": "*.pdf",
-    "recursive": true
+    "recursive": true,
+    "backend": "pipeline"          // default; pass "vlm-transformers" if 24 GB+ GPU
   }
 }
-// → {"job_id": "ab12cd…", "kind": "ingest_local_dir", "n_total": 42}
+// → {"job_id": "ab12cd…", "kind": "ingest_local_dir", "n_total": 42, "backend": "pipeline"}
 // later: {"tool": "job_status", "args": {"job_id": "ab12cd…"}}
 ```
+
+**MinerU backend default = `pipeline`.** The `vlm-transformers` backend
+loads MinerU's 1.2B Qwen2-VL into VRAM, which combined with our shared
+Qwen3-Embedding-4B exhausts a 12 GB GPU and wedges the parse. The
+`pipeline` backend (layout-CNN + OCR + table) parses a 2 MB arxiv
+preprint in ~90 sec on RTX 4070 with no VRAM contention; quality is
+slightly lower but still extracts title, abstract, sections, formulas,
+and figures cleanly. Pass `backend="vlm-transformers"` per-call if you
+have GPU headroom and want higher fidelity.
 
 Per ingested file this writes:
 * `<parse.dir>/sources/<paper_id>.md` — flat markdown (MinerU output).
 * `<parse.dir>/sources/<paper_id>.meta.json` — `LabPaper` sidecar
   ({paper_id_kind, title, source_path, n_chars, ingested_at, …}).
+  Tolerates extra fields written by `corpus_core.corpus_index.reindex`
+  (`n_chunks_after_split`, `indexed_at`) — they fold into the
+  `LabPaper.extra` dict on read.
 * `<parse.dir>/figures/<paper_id>/` — extracted PNG/JPG figures
   (when MinerU produces an `images/` subdir).
+* `<parse.dir>/embeddings.npy` + `<parse.dir>/index.json` — written by
+  the next `rebuild_index` call. `corpus_core.corpus_index.reindex`
+  writes the chunk index AT `parse.dir` (same level as `sources/`),
+  not under `embeddings.cache_dir`. lab-corpus's `LabCorpusServer`
+  loads from there.
 
 `paper_id` is auto-derived: arxiv-id pattern (`\d{4}\.\d{4,5}`) on
 the filename, else sha256 prefix of the file bytes. Pass an explicit
@@ -94,17 +155,22 @@ them the same `Encoder`, and serializes encode calls with a
 bash scripts/docker_serve_combined.sh \
     /srv/arxiv-radar/radar.toml \
     /srv/lab-corpus/radar.toml \
-    /srv/arxiv-radar/data \
+    /srv/arxiv-radar/cache/sources \
     /srv/arxiv-radar/cache \
     /srv/lab-corpus/cache
 
-# Watch logs
+# Watch logs (expect three index-load lines + supervisor banner)
 docker --context gomer logs -f lab-corpus-combined
 ```
 
 Both backends now reachable on gomer at `:8765` (arxiv-radar) and
-`:8766` (lab-corpus). For Claude Desktop, run two **stdio→HTTP
-proxies** (one per backend) over an SSH tunnel:
+`:8766` (lab-corpus). When migrating from a legacy
+`arxiv-radar-backend` that already binds `:8765`, deploy the combined
+container on alternate ports (e.g. `127.0.0.1:18765` + `:18766`) until
+you cut over.
+
+For Claude Desktop, run two **stdio→HTTP proxies** (one per backend)
+over an SSH tunnel:
 
 ```json
 {
@@ -193,13 +259,16 @@ Approximate breakdown (no preloaded models — those go in volumes):
 
 | Layer | Size |
 |---|---|
-| pytorch/pytorch:2.5.1-cuda12.4 base | ~7 GB |
+| pytorch/pytorch:2.7.1-cuda12.6-cudnn9-runtime base | ~9 GB |
 | MinerU `[core]` (vlm-transformers + pipeline + gradio) | ~2 GB |
-| arxiv-radar-mcp + sentence-transformers + mcp + numpy | ~500 MB |
-| lab_corpus_mcp glue (currently tiny) | ~5 MB |
-| **Total** | **~9.5 GB** |
+| corpus-core + arxiv-radar-mcp + sentence-transformers + mcp | ~500 MB |
+| lab_corpus_mcp + scripts | ~5 MB |
+| **Effective shipped tag** | **~12 GB total in `docker images`** |
 
-Pulled once to gomer; subsequent rebuilds reuse layers.
+Pulled once to gomer; subsequent rebuilds reuse layers. The build-time
+`audit_image.py` step verifies single-distribution invariants — no
+duplicate torch / sentence-transformers / mineru even after MinerU's
+~95 transitive pip deps install.
 
 ## Roadmap (lab-specific, not yet implemented)
 
