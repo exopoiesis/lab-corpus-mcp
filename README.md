@@ -63,7 +63,7 @@ lab-corpus-mcp/
 ├── Dockerfile                  # GPU image — parent dir = build context
 ├── docs/DEPLOY.md              # operations + Claude Desktop wiring
 ├── radar.example.toml          # config template
-├── scripts/                    # docker_*.sh wrappers, process_pdfs.sh
+├── scripts/                    # docker_*.sh wrappers (build, serve, model fetch)
 ├── src/lab_corpus_mcp/
 │   ├── __main__.py             # CLI: stdio (default) / --transport http / --remote
 │   ├── config.py               # LabConfig: embeddings + parse + server
@@ -71,7 +71,7 @@ lab-corpus-mcp/
 │   ├── ingest.py               # MinerU subprocess wrapper + ingest_one / ingest_dir
 │   └── server.py               # LabCorpusServer + LAB_TOOL_SPECS + serve/serve_http
 ├── tests/                      # pytest suite, 99% coverage on lab_corpus_mcp
-└── tmp/                        # local-iteration helpers (install_mineru.sh, …)
+└── tmp/                        # local-iteration helpers (gitignored)
 ```
 
 ## Tool surface (Phase 2B, 11 tools)

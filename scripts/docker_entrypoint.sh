@@ -14,11 +14,10 @@ case "${1:-mcp}" in
     build-cache)
         exec python -m arxiv_radar_mcp --build-cache "${@:2}"
         ;;
-    parse)
-        exec mineru "${@:2}"
-        ;;
     download-models)
-        # Fetch MinerU's pipeline / VLM models into the persistent volume.
+        # One-time fetch of MinerU's pipeline / VLM models into the
+        # `lab-corpus-ms` persistent volume so subsequent ingests reuse
+        # them. Invoked by scripts/docker_download_models.sh.
         exec mineru-models-download "${@:2}"
         ;;
     *)

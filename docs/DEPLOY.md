@@ -35,21 +35,37 @@ These persist across container restarts so we never re-download.
 
 ## Workflows
 
-### Parse PDFs into structured markdown + figures
+### Ingest PDFs (and DOCX / PPTX / images)
 
-```bash
-bash scripts/docker_parse_pdfs.sh \
-    /mnt/literature/pdfs \
-    /mnt/literature/parsed \
-    vlm-transformers
+Through the MCP server's `ingest_local_dir` tool — runs MinerU as a
+subprocess inside the already-warm lab-corpus container, persists a
+LabPaper sidecar per file, makes the result discoverable via
+`list_corpus` / `paper_info`, and is async (poll with `job_status`).
+
+```jsonc
+// from any MCP client (Claude Desktop, claude-code, …)
+{
+  "tool": "ingest_local_dir",
+  "args": {
+    "dir_path": "/data/pdfs/inbox",
+    "glob": "*.pdf",
+    "recursive": true
+  }
+}
+// → {"job_id": "ab12cd…", "kind": "ingest_local_dir", "n_total": 42}
+// later: {"tool": "job_status", "args": {"job_id": "ab12cd…"}}
 ```
 
-Per PDF this writes (under `/mnt/literature/parsed/<pdf_basename>/`):
-* `<name>.md` — markdown with inline figure refs and captions
-* `<name>_content_list.json` — flat reading-order JSON (consumed by the
-  literature loader once it lands)
-* `<name>_middle.json` — full structure with bboxes
-* `images/` — extracted PNG/JPG figures and tables
+Per ingested file this writes:
+* `<parse.dir>/sources/<paper_id>.md` — flat markdown (MinerU output).
+* `<parse.dir>/sources/<paper_id>.meta.json` — `LabPaper` sidecar
+  ({paper_id_kind, title, source_path, n_chars, ingested_at, …}).
+* `<parse.dir>/figures/<paper_id>/` — extracted PNG/JPG figures
+  (when MinerU produces an `images/` subdir).
+
+`paper_id` is auto-derived: arxiv-id pattern (`\d{4}\.\d{4,5}`) on
+the filename, else sha256 prefix of the file bytes. Pass an explicit
+`paper_id` to the `ingest_pdf` single-file tool to override.
 
 ### Build the embedding cache
 
@@ -94,26 +110,31 @@ into your Claude Desktop MCP config:
 Each Claude session spins up an ephemeral container; on exit it tears down
 (`--rm`). Persistent state stays in the named volumes + bind mounts.
 
-## Why a separate repo (and not a fork of arxiv-radar-mcp)
+## Why a separate repo (split by content source)
 
-`arxiv-radar-mcp` has a clear identity: feed-consumer for the
-`daily-arxiv-*` fork family. Public, narrow, stateless, MIT-licensed.
-You can fork the data sources independently.
+The repos split along **what they consume**, not along complexity:
 
-`lab-corpus-mcp` is the personal admin layer — write-mounts, MinerU
-heavyweight, job queues, eventually slides + video pipelines. Bundling
-this into arxiv-radar-mcp would inflate the simple feed-consumer with
-dependencies the public users don't need, and force its evolution to
-track lab-only requirements.
+* `arxiv-radar-mcp` owns **all arXiv content** — abstracts via the
+  `daily-arxiv-*` fork family, plus on-demand full-text fetched from
+  `arxiv.org/html/<id>` and `arxiv.org/e-print/<id>` (HTML and LaTeX
+  source). It chunks, indexes, and serves both abstract and fulltext
+  search via MCP. Heavy MinerU is intentionally NOT included — HTML
+  and LaTeX cover ~85-90% of arXiv submissions, the rest fails
+  cleanly with a pointer here.
 
-Two-repo split keeps:
-* arxiv-radar-mcp narrow + publishable
-* lab-corpus-mcp free to evolve aggressively (heavy deps, breaking
-  tools) without touching the upstream
+* `lab-corpus-mcp` owns **non-arXiv content** — uploaded PDFs (parsed
+  via MinerU on gomer GPU), future YouTube/video transcripts,
+  sideloaded books and conference preprints without arXiv IDs.
 
-The cost is ~500 lines of duplicated glue eventually, or — current
-choice — `lab-corpus-mcp` taking arxiv-radar-mcp as a pip dependency
-inside its Docker image.
+This boundary keeps the user flow consistent: a researcher who found
+something in an abstract via `search_abstract_*` can deepen the
+search with `search_paper_*` in the **same MCP catalog** — no need to
+install a second server. The heavy stuff stays where it actually
+needs to be heavy.
+
+`lab-corpus-mcp` takes arxiv-radar-mcp as a pip dependency inside
+this Docker image (`pip install -e /opt/arxiv-radar-mcp` in the
+Dockerfile). Encoder, search, indexes are reused from upstream.
 
 ## Image size
 
@@ -129,31 +150,25 @@ Approximate breakdown (no preloaded models — those go in volumes):
 
 Pulled once to gomer; subsequent rebuilds reuse layers.
 
-## Falling back without Docker
+## Roadmap (lab-specific, not yet implemented)
 
-The pre-Docker scripts still exist for local Windows iteration:
+After the 2026-05-01 boundary re-cut, the previously-planned literature
+loader and on-demand full-text fetcher moved to `arxiv-radar-mcp`
+(arxiv source has uniform IDs and HTML/LaTeX endpoints — fits the
+public repo's "feed reader" pattern). What stays here:
 
-* `tmp/install_mineru.sh` — MinerU venv + pip install + model fetch
-* `scripts/process_pdfs.sh` — local CPU MinerU run (slower than GPU)
+1. **`upload_corpus` MCP tool** — accepts archive path / dir of PDFs,
+   sniffs type, extracts to `/data/sources/<name>/`, runs MinerU
+   subprocess. **Non-arXiv** PDFs (books, conference preprints
+   without arXiv IDs, sideloaded reports). Job registry analogous to
+   the one in arxiv-radar-mcp but for MinerU batch runs.
+2. **YouTube / video → MD pipelines** — transcribe + chunk + add to
+   a fulltext-style index. Probably a new MCP tool family
+   `search_video_*` parallel to `search_paper_*`.
+3. **Sideloaded books** — long-form PDFs with chapter headings; MinerU
+   does the parse, then the chunker from arxiv-radar-mcp can be
+   reused (heading-based split is the same problem).
 
-These predate the bundled image. If gomer is unavailable they're the
-fallback path.
-
-## Roadmap (lab-specific tools, not yet implemented)
-
-The minimal scaffold today only re-exposes `arxiv_radar_mcp`'s search
-tools through a new container. Lab-specific MCP tools that we agreed to
-add (in this order):
-
-1. **Per-source cache shards** — `/cache/<source>/embeddings.npy` instead
-   of the current single monolithic cache. Allows incremental rebuilds.
-2. **Dynamic source discovery** — scan `/data/sources/*` subdirs,
-   detect type (abstracts JSON / MinerU output / raw PDFs) automatically.
-3. **Job registry** — `src/lab_corpus_mcp/jobs.py` with persistence at
-   `/data/jobs.json`, lockfile to prevent concurrent admin ops.
-4. **`upload_corpus` MCP tool** — accepts archive path, sniffs type,
-   extracts to `/data/sources/<name>/`, runs MinerU subprocess if PDFs.
-5. **`rebuild_index`, `corpus_stats`, `job_status`** — admin tool surface.
-6. **Literature loader** — once we see real MinerU output structure.
-
-See arxiv-radar-mcp's task list (#23, #27) for related items.
+The async job registry, ThreadPoolExecutor + persistence pattern, and
+the chunker are all imported from `arxiv-radar-mcp` to avoid
+duplicating that glue here.
