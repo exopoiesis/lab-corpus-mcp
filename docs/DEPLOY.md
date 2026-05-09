@@ -270,25 +270,35 @@ Pulled once to gomer; subsequent rebuilds reuse layers. The build-time
 duplicate torch / sentence-transformers / mineru even after MinerU's
 ~95 transitive pip deps install.
 
-## Roadmap (lab-specific, not yet implemented)
+## Roadmap
 
 After the 2026-05-01 boundary re-cut, the previously-planned literature
 loader and on-demand full-text fetcher moved to `arxiv-radar-mcp`
 (arxiv source has uniform IDs and HTML/LaTeX endpoints — fits the
 public repo's "feed reader" pattern). What stays here:
 
-1. **`upload_corpus` MCP tool** — accepts archive path / dir of PDFs,
-   sniffs type, extracts to `/data/sources/<name>/`, runs MinerU
-   subprocess. **Non-arXiv** PDFs (books, conference preprints
-   without arXiv IDs, sideloaded reports). Job registry analogous to
-   the one in arxiv-radar-mcp but for MinerU batch runs.
-2. **YouTube / video → MD pipelines** — transcribe + chunk + add to
-   a fulltext-style index. Probably a new MCP tool family
+1. ✅ **PDF ingest tools** — DONE (Phase 2B-1, 2026-05-09). The
+   originally-planned `upload_corpus` shipped as `ingest_pdf`
+   (single file) + `ingest_local_dir` (bulk by glob, optional
+   recursion). Both async, both write LabPaper sidecars + figures
+   + post-ingest chunk index. End-to-end verified on
+   `arxiv:2512.14129` (Yin et al., (Cr,Fe)S pyrrhotite) — closes
+   arxiv-radar-mcp's deferred U7.
+2. ✅ **MinerU backend default = `pipeline`** (Phase 2B+, 2026-05-10).
+   The 1.2B Qwen2-VL backend wedges on a 12 GB GPU; pipeline does
+   2 MB / 90 sec while sharing VRAM with our embedding Qwen.
+3. ⏳ **PDF-content DOI extraction** — currently filename-based
+   arxiv-id pattern + sha256 fallback. Adding pypdf-based DOI lookup
+   to fill in `paper_id_kind="doi"` for arxiv-less PDFs.
+4. ⏳ **YouTube / video → MD pipelines** — transcribe + chunk + add
+   to a fulltext-style index. Probably a new MCP tool family
    `search_video_*` parallel to `search_paper_*`.
-3. **Sideloaded books** — long-form PDFs with chapter headings; MinerU
-   does the parse, then the chunker from arxiv-radar-mcp can be
+5. ⏳ **Sideloaded books** — long-form PDFs with chapter headings;
+   MinerU does the parse, then the chunker from corpus-core can be
    reused (heading-based split is the same problem).
+6. ⏳ **GitHub Actions CI** — pytest matrix on push/PR for Python
+   3.11–3.13. Cheap (~30 LOC YAML), unblocks public traffic.
 
-The async job registry, ThreadPoolExecutor + persistence pattern, and
-the chunker are all imported from `arxiv-radar-mcp` to avoid
-duplicating that glue here.
+corpus-core, arxiv-radar-mcp and lab-corpus-mcp share one async
+JobRegistry + chunker via [corpus-core](https://github.com/exopoiesis/corpus-core),
+so no glue duplication between siblings.
