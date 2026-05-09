@@ -34,7 +34,20 @@ def _ok(label: str, value: str) -> None:
 def main() -> int:
     print("=== combined-image audit ===")
 
-    # 1. torch — must be the base-image install, not pip-upgraded.
+    # 0. Python — must satisfy ALL three siblings' `requires-python`:
+    #    arxiv-radar-mcp >=3.11, lab-corpus-mcp >=3.10,<3.14, MinerU
+    #    3.x >=3.10,<3.14. The intersection is [3.11, 3.13].
+    py = sys.version_info
+    _ok("python.version:", f"{py.major}.{py.minor}.{py.micro}")
+    if py < (3, 11):
+        _fail(f"python {py.major}.{py.minor} < 3.11 (arxiv-radar-mcp requires-python)")
+    if py >= (3, 14):
+        _fail(f"python {py.major}.{py.minor} >= 3.14 (MinerU + lab-corpus upper bound)")
+
+    # 1. torch — must be the base-image install, NOT pip-upgraded by
+    #    `pip install mineru[core]`. Floor is 2.6 (MinerU 3.x). If the
+    #    base image drifts below that, MinerU pulls a second torch and
+    #    the image grows ~800 MB.
     try:
         import torch
     except ImportError:
@@ -42,6 +55,14 @@ def main() -> int:
     _ok("torch.__version__:", torch.__version__)
     _ok("torch.__file__:", torch.__file__)
     _ok("torch.cuda.is_available():", str(torch.cuda.is_available()))
+
+    parts = torch.__version__.split("+")[0].split(".")[:2]
+    torch_major, torch_minor = (int(x) for x in parts)
+    if (torch_major, torch_minor) < (2, 6):
+        _fail(f"torch {torch.__version__} < 2.6 — MinerU 3.x will "
+              f"pip-install a second torch on top, defeating the "
+              f"single-pytorch invariant. Bump the FROM line in "
+              f"Dockerfile to a base with torch>=2.6.")
 
     # 2. heavy ML siblings — exactly one install each.
     for name in ("sentence_transformers", "transformers", "mineru"):

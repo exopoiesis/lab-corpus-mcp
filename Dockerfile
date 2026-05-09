@@ -11,7 +11,14 @@
 #   docker build -f lab-corpus-mcp/Dockerfile -t exopoiesis/lab-corpus-gpu:latest .
 #
 # (See scripts/docker_build.sh — it sets the right context.)
-FROM pytorch/pytorch:2.5.1-cuda12.4-cudnn9-runtime
+#
+# Base: torch 2.7.1 + CUDA 12.6 (Python 3.11). The base ships exactly
+# what MinerU 3.x requires (`torch>=2.6,<3`), so `pip install
+# mineru[core]` doesn't pay for a separate ~800 MB torch reinstall.
+# We deliberately don't pin torch in any of the three sibling
+# pyprojects — MinerU's transitive constraint is the single source
+# of truth for acceptable torch versions in this image.
+FROM pytorch/pytorch:2.7.1-cuda12.6-cudnn9-runtime
 
 LABEL org.opencontainers.image.title="lab-corpus-gpu" \
       org.opencontainers.image.description="MinerU + arxiv-radar-mcp + lab admin tools" \
