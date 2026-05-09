@@ -90,12 +90,30 @@ def write_meta(meta_path: Path, paper: LabPaper) -> None:
 
 
 def read_meta(meta_path: Path) -> LabPaper | None:
-    """Inverse of `write_meta`. Returns None on missing/corrupt JSON."""
+    """Inverse of `write_meta`. Returns None on missing/corrupt JSON.
+
+    Tolerates extra fields written by other tools that share the
+    sources tree — e.g. `corpus_core.corpus_index.reindex` adds
+    `n_chunks_after_split` and `indexed_at` (arxiv-radar convention).
+    Unknown keys get folded into `LabPaper.extra` so nothing is lost,
+    and known LabPaper fields stay strongly typed.
+    """
+    import dataclasses
+
     try:
         data = json.loads(meta_path.read_text(encoding="utf-8"))
     except (FileNotFoundError, OSError, json.JSONDecodeError):
         return None
-    return LabPaper(**data)
+
+    known = {f.name for f in dataclasses.fields(LabPaper)}
+    filtered = {k: v for k, v in data.items() if k in known}
+    extra = {k: v for k, v in data.items() if k not in known}
+    if extra:
+        filtered["extra"] = {**(filtered.get("extra") or {}), **extra}
+    try:
+        return LabPaper(**filtered)
+    except TypeError:
+        return None
 
 
 def load_lab_papers(parse_dir: Path) -> dict[str, LabPaper]:

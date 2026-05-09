@@ -79,7 +79,13 @@ class LabCorpusServer:
     ) -> None:
         self.config = config
         self.parse_dir: Path = config.parse.dir
-        self.index_dir: Path = config.embeddings.cache_dir
+        # corpus_core.corpus_index.reindex writes embeddings.npy + index.json
+        # at the SAME level as `sources/` (the dir containing the parsed
+        # markdowns). For lab-corpus that's `parse.dir`. embeddings.cache_dir
+        # in our config is kept around for legacy uniformity with
+        # arxiv-radar-mcp's abstract-cache convention but is not where
+        # the chunk index lives.
+        self.index_dir: Path = self.parse_dir
         self.mineru_runner = mineru_runner
 
         self.papers: dict[str, LabPaper] = load_lab_papers(self.parse_dir)
@@ -88,7 +94,10 @@ class LabCorpusServer:
         # Qwen3-4B copy in VRAM (see lab_corpus_mcp.combined). Standalone
         # callers omit it and we construct our own (lazy weight load).
         self.encoder = encoder if encoder is not None else Encoder(config)
-        self.jobs = JobRegistry(cache_dir=self.index_dir.parent)
+        # JobRegistry persists at <embeddings.cache_dir.parent>/jobs/ —
+        # i.e. /srv/lab-corpus/cache/jobs/. Independent of the chunk
+        # index dir, so reindex churn doesn't compete with job state.
+        self.jobs = JobRegistry(cache_dir=config.embeddings.cache_dir.parent)
 
         self.fulltext_index: EmbeddingIndex | None = None
         try:

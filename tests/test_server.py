@@ -169,7 +169,10 @@ def test_init_without_index_sets_fulltext_index_none(lab_config):
     try:
         assert srv.fulltext_index is None
         assert srv.parse_dir == lab_config.parse.dir
-        assert srv.index_dir == lab_config.embeddings.cache_dir
+        # index_dir == parse_dir — corpus_core.corpus_index.reindex
+        # writes embeddings.npy + index.json at the same level as
+        # `sources/`, not under the legacy embeddings.cache_dir.
+        assert srv.index_dir == lab_config.parse.dir
         assert srv.papers == {}
     finally:
         srv.jobs.shutdown()
