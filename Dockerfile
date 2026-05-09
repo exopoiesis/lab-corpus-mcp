@@ -62,6 +62,13 @@ RUN pip install -e /opt/lab-corpus-mcp
 COPY lab-corpus-mcp/scripts/docker_entrypoint.sh /usr/local/bin/lab-corpus-entrypoint
 RUN chmod +x /usr/local/bin/lab-corpus-entrypoint
 
+# Build-time audit — fail fast if pip somehow installed two torches,
+# two sentence-transformers, or any of the three siblings is missing.
+# See scripts/audit_image.py for the single source of truth on what
+# the combined image is expected to contain.
+COPY lab-corpus-mcp/scripts/audit_image.py /usr/local/bin/audit_image.py
+RUN python /usr/local/bin/audit_image.py
+
 RUN mkdir -p /data /cache /workspace
 WORKDIR /workspace
 
