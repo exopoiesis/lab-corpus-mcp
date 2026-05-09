@@ -19,23 +19,32 @@ classifiers = [
     "Programming Language :: Python :: 3.13",
 ]
 
-# arxiv-radar-mcp is a hard dependency: we reuse its Encoder, search
-# primitives, Reranker, and base RadarServer. During development both
-# repos live side-by-side under the same parent dir, and the docker
-# image installs arxiv-radar-mcp from the COPY'd source.
+# Three siblings share a Docker image / dev tree:
+#   * corpus-core      — Encoder, EmbeddingIndex, search primitives,
+#                        chunker, JobRegistry, MCP scaffold.
+#   * arxiv-radar-mcp  — RadarServer, arxiv shards, daily refresh.
+#                        Lab depends on it for `combined` mode (one
+#                        Qwen for both backends).
+#   * lab-corpus-mcp   — this package.
 #
-# For pip-only local installs (no docker), do:
+# For pip-only local installs (no docker), siblings must be path-installed
+# in dependency order:
+#   pip install -e ../corpus-core
 #   pip install -e ../arxiv-radar-mcp
 #   pip install -e .
+#
+# The Docker image (Dockerfile) does the same thing inside the container.
 dependencies = [
+    "corpus-core>=0.1.0",
+    "arxiv-radar-mcp>=0.0.1",
     "mcp>=1.0",
     "numpy>=1.26",
     "pyyaml>=6.0",
     "tomli>=2.0; python_version < '3.11'",
     "platformdirs>=4.0",
     "httpx>=0.27",
-    # MinerU is the heavy one; pulled in via Docker, can be omitted from
-    # local-only installs by using the [parse] extra explicitly.
+    # MinerU is the heavy one; pulled in via the Docker image (or the
+    # [parse] extra below for local installs).
 ]
 
 [project.optional-dependencies]

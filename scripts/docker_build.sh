@@ -1,10 +1,11 @@
 #!/usr/bin/env bash
 # Build the lab-corpus GPU image on gomer.
 #
-# Context = parent directory containing both arxiv-radar-mcp/ and
-# lab-corpus-mcp/, since the Dockerfile COPYs both. The Docker daemon
-# streams the context over the gomer context link; .dockerignore keeps
-# the payload tiny (only src/, pyproject, README ship per repo).
+# Context = parent directory containing all three sibling repos
+# (corpus-core/, arxiv-radar-mcp/, lab-corpus-mcp/) since the Dockerfile
+# COPYs from each. The Docker daemon streams the context over the gomer
+# context link; .dockerignore keeps the payload tiny (only src/,
+# pyproject, README ship per repo).
 set -e
 export MSYS_NO_PATHCONV=1
 export MSYS2_ARG_CONV_EXCL='*'

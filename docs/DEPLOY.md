@@ -16,9 +16,10 @@ go. Build context is the parent directory of both repos; see
 ## One-time setup
 
 ```bash
-# Both repos must be siblings under D:/home/ignat/project-third-matter/git/
-#   ├── arxiv-radar-mcp/
-#   └── lab-corpus-mcp/
+# All three sibling repos must live under D:/home/ignat/project-third-matter/git/
+#   ├── corpus-core/         (shared Encoder, JobRegistry, MCP scaffold)
+#   ├── arxiv-radar-mcp/     (RadarServer + arxiv shards)
+#   └── lab-corpus-mcp/      (this repo, MinerU + combined supervisor)
 
 # Build the image on gomer (parent dir streams as Docker context)
 bash scripts/docker_build.sh

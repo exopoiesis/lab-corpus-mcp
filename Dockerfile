@@ -1,7 +1,13 @@
-# lab-corpus-mcp + arxiv-radar-mcp + MinerU bundled image.
+# lab-corpus-mcp + arxiv-radar-mcp + corpus-core + MinerU bundled image.
 #
-# Build context is the PARENT directory containing both repos so we can
-# COPY both in one go:
+# Build context is the PARENT directory containing all three sibling
+# repos so we can COPY them in one go:
+#   <parent>/
+#     ├── corpus-core/
+#     ├── arxiv-radar-mcp/
+#     └── lab-corpus-mcp/
+#
+# Build:
 #   docker build -f lab-corpus-mcp/Dockerfile -t exopoiesis/lab-corpus-gpu:latest .
 #
 # (See scripts/docker_build.sh — it sets the right context.)
@@ -30,8 +36,17 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
 RUN pip install --upgrade pip && \
     pip install "mineru[core]"
 
-# Sister repo: arxiv-radar-mcp provides Encoder, search, Reranker, base MCP.
-# COPY'd from the parent context.
+# Sibling 1: corpus-core (shared Encoder, EmbeddingIndex, search, MCP
+# scaffold, JobRegistry). Phase 3 broke it out of arxiv-radar-mcp, so
+# it now installs first as a peer.
+COPY corpus-core/pyproject.toml /opt/corpus-core/
+COPY corpus-core/README.md     /opt/corpus-core/
+COPY corpus-core/src           /opt/corpus-core/src
+RUN pip install -e /opt/corpus-core
+
+# Sibling 2: arxiv-radar-mcp (RadarServer, arxiv shards, refresh).
+# Required because lab_corpus_mcp.combined imports its server module
+# for combined-mode (single shared Qwen across both backends).
 COPY arxiv-radar-mcp/pyproject.toml /opt/arxiv-radar-mcp/
 COPY arxiv-radar-mcp/README.md     /opt/arxiv-radar-mcp/
 COPY arxiv-radar-mcp/src           /opt/arxiv-radar-mcp/src

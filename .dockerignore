@@ -1,5 +1,5 @@
-# Build context is the PARENT directory (containing arxiv-radar-mcp/ and
-# lab-corpus-mcp/) — entries below apply at that root level.
+# Build context is the PARENT directory (containing corpus-core/,
+# arxiv-radar-mcp/, lab-corpus-mcp/) — entries below apply at that root.
 
 # Per-repo developer junk
 **/.venv/

@@ -14,18 +14,19 @@ embedding stack.
 
 - **MinerU** for PDF / DOCX / PPTX / image parsing — same VLM-backed
   pipeline that produces `<file>_content_list.json` + extracted figures.
-- **`corpus_core`** (shipped inside `arxiv-radar-mcp` until Phase 3 of
-  the extraction plan) — provides the embedding `Encoder`, search
-  primitives, cross-encoder `Reranker`, `JobRegistry`, and the generic
-  MCP server scaffold (`make_method_dispatcher`, `build_mcp_app`,
-  `serve_stdio`, `serve_streamable_http`). Same Qwen3-Embedding-4B
-  native default empirically validated in
-  `arxiv-radar-mcp/docs/MODEL_BENCHMARKS.md`.
-- **`lab_corpus_mcp.server`** — `LabCorpusServer` handler + `LAB_TOOL_SPECS`
-  catalogue, both wired through `corpus_core.mcp_scaffold`. The Phase 2A
-  surface is `corpus_stats`, `list_corpus`, `job_status`, `job_list` —
-  enough to verify dispatcher + transport + JobRegistry. Ingest / search
-  tools land in Phase 2B.
+- **[`corpus-core`](https://github.com/exopoiesis/corpus-core)** —
+  shared infrastructure extracted in Phase 3: `Encoder`,
+  `EmbeddingIndex`, `JobRegistry`, search primitives, the chunker,
+  `Reranker`, and the generic MCP server scaffold
+  (`make_method_dispatcher`, `build_mcp_app`, `serve_stdio`,
+  `serve_streamable_http`). Same Qwen3-Embedding-4B native default
+  empirically validated in `arxiv-radar-mcp/docs/MODEL_BENCHMARKS.md`.
+- **[`arxiv-radar-mcp`](https://github.com/exopoiesis/arxiv-radar-mcp)**
+  — the public-data arxiv backend. Required at runtime because
+  `lab_corpus_mcp.combined` builds the supervisor that runs both
+  servers in one container with one shared Encoder.
+- **`lab_corpus_mcp.server`** — `LabCorpusServer` handler + 11-tool
+  `LAB_TOOL_SPECS` catalogue, wired through `corpus_core.mcp_scaffold`.
 
 ## Architecture
 
