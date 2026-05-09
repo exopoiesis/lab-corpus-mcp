@@ -6,8 +6,9 @@ set -e
 
 case "${1:-mcp}" in
     mcp)
-        # Shipped today via arxiv_radar_mcp; lab_corpus_mcp will subclass
-        # RadarServer and add upload / jobs / corpus_stats tools later.
+        # Phase 2A: lab_corpus_mcp ships its own MCP server built on
+        # corpus_core.mcp_scaffold (corpus_stats, list_corpus, job_status,
+        # job_list). Ingest / search tools land in Phase 2B.
         exec python -m lab_corpus_mcp "${@:2}"
         ;;
     build-cache)

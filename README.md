@@ -1,6 +1,7 @@
 # lab-corpus-mcp
 
-Personal research-OS layer on top of [arxiv-radar-mcp](https://github.com/exopoiesis/arxiv-radar-mcp).
+Personal research-OS layer that shares the corpus-core stack with
+[arxiv-radar-mcp](https://github.com/exopoiesis/arxiv-radar-mcp).
 
 Where `arxiv-radar-mcp` is a narrow, public-data MCP feed for the
 `daily-arxiv-*` fork family, **lab-corpus-mcp** is the private corpus
@@ -13,12 +14,18 @@ embedding stack.
 
 - **MinerU** for PDF / DOCX / PPTX / image parsing — same VLM-backed
   pipeline that produces `<file>_content_list.json` + extracted figures.
-- **arxiv-radar-mcp** as a pip dependency — provides the embedding
-  Encoder, search primitives, cross-encoder reranker, and the base MCP
-  server. (Same Qwen3-Embedding-4B native default we empirically
-  validated; see `arxiv-radar-mcp/docs/MODEL_BENCHMARKS.md`.)
-- Lab-specific tools (planned, see `docs/DEPLOY.md`):
-  `upload_corpus`, `rebuild_index`, `corpus_stats`, `job_status`.
+- **`corpus_core`** (shipped inside `arxiv-radar-mcp` until Phase 3 of
+  the extraction plan) — provides the embedding `Encoder`, search
+  primitives, cross-encoder `Reranker`, `JobRegistry`, and the generic
+  MCP server scaffold (`make_method_dispatcher`, `build_mcp_app`,
+  `serve_stdio`, `serve_streamable_http`). Same Qwen3-Embedding-4B
+  native default empirically validated in
+  `arxiv-radar-mcp/docs/MODEL_BENCHMARKS.md`.
+- **`lab_corpus_mcp.server`** — `LabCorpusServer` handler + `LAB_TOOL_SPECS`
+  catalogue, both wired through `corpus_core.mcp_scaffold`. The Phase 2A
+  surface is `corpus_stats`, `list_corpus`, `job_status`, `job_list` —
+  enough to verify dispatcher + transport + JobRegistry. Ingest / search
+  tools land in Phase 2B.
 
 ## Architecture
 
@@ -28,11 +35,13 @@ embedding stack.
               │ ┌──────────────────────────────────────┐ │
               │ │ MinerU 2.x (PDF → md + figures)      │ │
               │ ├──────────────────────────────────────┤ │
-              │ │ arxiv-radar-mcp (pip dep)            │ │
-              │ │   Encoder · search · Reranker · MCP  │ │
+              │ │ corpus_core  (shared with radar)     │ │
+              │ │   Encoder · search · Reranker        │ │
+              │ │   JobRegistry · mcp_scaffold         │ │
               │ ├──────────────────────────────────────┤ │
               │ │ lab_corpus_mcp                       │ │
-              │ │   loaders · upload · jobs            │ │
+              │ │   LabCorpusServer · LAB_TOOL_SPECS   │ │
+              │ │   loaders · upload · jobs (planned)  │ │
               │ └──────────────────────────────────────┘ │
               └──────────────────────────────────────────┘
                        │                          ▲
@@ -55,15 +64,22 @@ lab-corpus-mcp/
 ├── docs/DEPLOY.md              # operations + Claude Desktop wiring
 ├── radar.example.toml          # config template
 ├── scripts/                    # docker_*.sh wrappers, process_pdfs.sh
-├── src/lab_corpus_mcp/         # Python package (delegates to arxiv_radar_mcp for MCP for now)
+├── src/lab_corpus_mcp/
+│   ├── __main__.py             # CLI: stdio (default) / --transport http / --remote
+│   ├── config.py               # LabConfig: embeddings + parse + server
+│   └── server.py               # LabCorpusServer + LAB_TOOL_SPECS + serve/serve_http
 ├── tests/
 └── tmp/                        # local-iteration helpers (install_mineru.sh, …)
 ```
 
 ## Status
 
-Skeleton + Docker bundle migrated from `arxiv-radar-mcp`.
-Lab-specific tools (upload, jobs, loaders) — pending. See task list.
+- **Phase 2A done (2026-05-09):** own MCP server on `corpus_core.mcp_scaffold`
+  (no more pass-through to `arxiv_radar_mcp.__main__`). Skeleton tool
+  surface: `corpus_stats`, `list_corpus`, `job_status`, `job_list`.
+- **Phase 2B (next):** MinerU-driven `ingest_pdf` / `ingest_local_dir`,
+  then `corpus_core.corpus_index.reindex` over the parsed tree.
+- **Phase 2B+:** `search_paper_*` and slide / video loaders.
 
 ## License
 
