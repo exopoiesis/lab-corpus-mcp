@@ -9,6 +9,13 @@ Phase 2B-1 surface:
   * `ingest_dir(dir_path, parse_dir, *, glob, recursive)` — bulk variant
     used by the `ingest_local_dir` MCP tool.
 
+Phase 2B+ U14 surface (2026-05-13):
+  * `fetch_and_ingest(url, parse_dir, *, paper_id=None, ...)` — download
+    a URL to `<parse.dir>/inbox/<filename>` via `corpus_core.fetch_url`,
+    then `ingest_one()` on the result. Used by the `ingest_url` and
+    `ingest_arxiv_pdf` MCP tools to close the s142 dogfood gap (no
+    server-side fetch-by-URL).
+
 The MinerU CLI (`mineru -p <input> -o <out>`) is the only external
 dependency; tests stub it with a fake that just writes a markdown
 stub, so the orchestration logic is fully covered without a 2 GB
@@ -17,6 +24,7 @@ image (see `lab-corpus-mcp/Dockerfile`).
 """
 from __future__ import annotations
 
+import hashlib
 import logging
 import os
 import shutil
@@ -24,7 +32,15 @@ import subprocess
 import tempfile
 from dataclasses import asdict, replace
 from pathlib import Path
-from typing import Callable
+from typing import Callable, Protocol
+from urllib.parse import urlparse
+
+from corpus_core.http_fetch import (
+    FetchResult,
+    Throttle,
+    fetch_url,
+    get_arxiv_throttle,
+)
 
 from lab_corpus_mcp.corpus import (
     LabPaper,
@@ -228,3 +244,136 @@ def ingest_dir(
         "ok": ok,
         "failed": failed,
     }
+
+
+# ---------------------------------------------------------------------------
+# U14 — fetch-by-URL (PHASE 2B+, 2026-05-13)
+# ---------------------------------------------------------------------------
+#
+# Closes the s142 dogfood gap: lab-corpus's pre-U14 surface required a
+# server-side filesystem path for ingest_pdf / ingest_local_dir, so the
+# user had to curl + docker cp + ingest_local_dir for every fresh PDF.
+# `fetch_and_ingest` collapses that to one call: download via
+# `corpus_core.fetch_url` into `<parse_dir>/inbox/`, then `ingest_one`.
+#
+# arxiv.org hosts get the shared module-global arxiv throttle for free
+# (1 req / 3 sec), so in the combined image both servers share one
+# budget and never double-spam.
+
+
+INBOX_SUBDIR = "inbox"
+
+
+class _Fetcher(Protocol):
+    """Test seam — matches the subset of corpus_core.fetch_url we use."""
+
+    def __call__(
+        self,
+        url: str,
+        dest_path: Path,
+        *,
+        throttle: Throttle | None,
+        timeout_s: float,
+    ) -> FetchResult: ...
+
+
+def _is_arxiv_url(url: str) -> bool:
+    """True if the URL host is arxiv.org or a subdomain thereof."""
+    netloc = urlparse(url).netloc.lower()
+    return netloc == "arxiv.org" or netloc.endswith(".arxiv.org")
+
+
+_KNOWN_DOC_EXTS = {".pdf", ".docx", ".pptx", ".png", ".jpg", ".jpeg"}
+
+
+def _filename_from_url(url: str, paper_id: str | None) -> str:
+    """Derive a stable filename for the inbox.
+
+    Resolution order:
+      1. Explicit ``paper_id`` → ``<paper_id>.pdf``.
+      2. Last URL path segment if it carries a known extension.
+      3. arxiv.org/{pdf,abs}/<id> → ``<id>.pdf`` (so ``derive_paper_id``
+         picks up the arxiv pattern from the filename downstream).
+      4. URL-hash fallback ``url-<sha1[:12]>.pdf`` — deterministic but
+         opaque; ingest_one will fall back to sha256 of file contents.
+    """
+    if paper_id:
+        return f"{paper_id}.pdf"
+
+    parsed = urlparse(url)
+    last = parsed.path.rsplit("/", 1)[-1] if parsed.path else ""
+
+    if last and Path(last).suffix.lower() in _KNOWN_DOC_EXTS:
+        return last
+
+    if _is_arxiv_url(url) and last:
+        # arxiv.org/pdf/2410.04059 → last="2410.04059", no extension. Add .pdf
+        # so derive_paper_id matches the arxiv_id pattern on the stem.
+        return f"{last}.pdf"
+
+    digest = hashlib.sha1(url.encode("utf-8")).hexdigest()[:12]
+    return f"url-{digest}.pdf"
+
+
+def fetch_and_ingest(
+    url: str,
+    parse_dir: Path,
+    *,
+    paper_id: str | None = None,
+    inbox_subdir: str = INBOX_SUBDIR,
+    timeout: int = 600,
+    fetch_timeout_s: float = 60.0,
+    backend: str = DEFAULT_BACKEND,
+    runner: MineruRunner | None = None,
+    fetcher: _Fetcher | None = None,
+) -> LabPaper:
+    """Download ``url`` then ``ingest_one`` the result. Returns persisted ``LabPaper``.
+
+    Throttle is auto-selected: arxiv.org hosts share the module-global
+    ``corpus_core.http_fetch.get_arxiv_throttle()`` (1 req / 3 sec, ToS-
+    compliant); other hosts get no rate limit by default.
+
+    Failures bubble out as ``IngestError`` so the job-registry path
+    surfaces them uniformly with MinerU failures.
+
+    Args:
+        url: Absolute http(s) URL to GET.
+        parse_dir: Same ``parse.dir`` used by ``ingest_one``. The
+            download lands in ``<parse_dir>/<inbox_subdir>/<filename>``.
+        paper_id: Optional explicit id — also dictates the filename
+            (``<paper_id>.pdf``) so the meta path resolves
+            deterministically.
+        inbox_subdir: Where to land downloads. Default ``inbox``.
+        timeout: MinerU subprocess timeout (sec) — same semantics as
+            ``ingest_one``.
+        fetch_timeout_s: Per-request HTTP timeout (sec).
+        backend: MinerU backend forwarded to ``ingest_one``.
+        runner: MinerU runner override (test injection).
+        fetcher: HTTP fetcher override (test injection); defaults to
+            ``corpus_core.http_fetch.fetch_url``.
+
+    Returns:
+        Persisted ``LabPaper``. The downloaded PDF stays under
+        ``<parse_dir>/<inbox_subdir>/`` so ``source_path`` remains
+        valid for re-ingest / debugging.
+    """
+    if not url or not url.startswith(("http://", "https://")):
+        raise IngestError(f"invalid url: {url!r}")
+
+    inbox = parse_dir / inbox_subdir
+    inbox.mkdir(parents=True, exist_ok=True)
+    filename = _filename_from_url(url, paper_id)
+    dest = inbox / filename
+
+    throttle = get_arxiv_throttle() if _is_arxiv_url(url) else None
+    fetch = fetcher if fetcher is not None else fetch_url
+    result = fetch(url, dest, throttle=throttle, timeout_s=fetch_timeout_s)
+    if not result.ok:
+        raise IngestError(
+            f"fetch failed: {url}: {result.error or f'status={result.status}'}"
+        )
+
+    return ingest_one(
+        dest, parse_dir,
+        paper_id=paper_id, timeout=timeout, backend=backend, runner=runner,
+    )

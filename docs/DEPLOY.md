@@ -101,6 +101,42 @@ LabPaper sidecar per file, makes the result discoverable via
 // later: {"tool": "job_status", "args": {"job_id": "ab12cd…"}}
 ```
 
+### Ingest by URL (U14, 2026-05-13)
+
+`ingest_local_dir` requires the PDF to already sit on the server's
+filesystem. For one-shot ingest of a remote PDF (arxiv preprint,
+journal supplement, OSF / Zenodo deposit), call **`ingest_url`** or its
+arxiv-specific shorthand **`ingest_arxiv_pdf`** — both download server-
+side via `corpus_core.http_fetch.fetch_url`, land the file under
+`<parse.dir>/inbox/`, then run the existing MinerU + reindex path.
+
+```jsonc
+// Arxiv-specific shorthand — paper_id is forced to the arxiv id.
+{
+  "tool": "ingest_arxiv_pdf",
+  "args": {"arxiv_id": "2512.14129"}
+}
+// → {"job_id": "ef34ab…", "kind": "ingest_arxiv_pdf",
+//    "arxiv_id": "2512.14129", "backend": "pipeline"}
+
+// Generic URL — paper_id auto-derived from filename (or sha256 fallback);
+// pass `paper_id` to override.
+{
+  "tool": "ingest_url",
+  "args": {
+    "url": "https://example.org/preprints/ai4chem.pdf",
+    "paper_id": "ai4chem-2026"
+  }
+}
+// → {"job_id": "cd56ef…", "kind": "ingest_url", "backend": "pipeline"}
+```
+
+**Throttle sharing:** arxiv.org URLs go through the singleton
+`corpus_core.http_fetch.get_arxiv_throttle()` so the combined image
+(arxiv-radar's HTML/LaTeX fetcher + lab-corpus's PDF fetcher) shares
+one 1 req / 3 sec budget instead of double-spamming. Non-arxiv hosts
+are unthrottled by default.
+
 **MinerU backend default = `pipeline`.** The `vlm-transformers` backend
 loads MinerU's 1.2B Qwen2-VL into VRAM, which combined with our shared
 Qwen3-Embedding-4B exhausts a 12 GB GPU and wedges the parse. The
@@ -287,6 +323,12 @@ public repo's "feed reader" pattern). What stays here:
 2. ✅ **MinerU backend default = `pipeline`** (Phase 2B+, 2026-05-10).
    The 1.2B Qwen2-VL backend wedges on a 12 GB GPU; pipeline does
    2 MB / 90 sec while sharing VRAM with our embedding Qwen.
+2a. ✅ **Fetch-by-URL** (U14, 2026-05-13). `ingest_url(url, paper_id?)`
+    and `ingest_arxiv_pdf(arxiv_id)` MCP tools download server-side
+    via `corpus_core.fetch_url`, dropping the curl + docker cp +
+    ingest_local_dir workflow that surfaced in the s142 dogfood.
+    arxiv hosts share the singleton 1 req / 3 sec throttle with
+    arxiv-radar's HTML/LaTeX fetcher in the combined image.
 3. ⏳ **PDF-content DOI extraction** — currently filename-based
    arxiv-id pattern + sha256 fallback. Adding pypdf-based DOI lookup
    to fill in `paper_id_kind="doi"` for arxiv-less PDFs.

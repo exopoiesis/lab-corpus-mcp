@@ -25,7 +25,7 @@ embedding stack.
   — the public-data arxiv backend. Required at runtime because
   `lab_corpus_mcp.combined` builds the supervisor that runs both
   servers in one container with one shared Encoder.
-- **`lab_corpus_mcp.server`** — `LabCorpusServer` handler + 11-tool
+- **`lab_corpus_mcp.server`** — `LabCorpusServer` handler + 13-tool
   `LAB_TOOL_SPECS` catalogue, wired through `corpus_core.mcp_scaffold`.
 
 ## Architecture
@@ -70,13 +70,13 @@ lab-corpus-mcp/
 │   ├── combined.py             # supervisor: arxiv-radar + lab-corpus, shared Encoder
 │   ├── config.py               # LabConfig: embeddings + parse + server
 │   ├── corpus.py               # LabPaper schema + paper_id derivation + on-disk loader
-│   ├── ingest.py               # MinerU subprocess wrapper + ingest_one / ingest_dir
+│   ├── ingest.py               # MinerU wrapper: ingest_one / ingest_dir / fetch_and_ingest (U14)
 │   └── server.py               # LabCorpusServer + LAB_TOOL_SPECS + serve/serve_http
 ├── tests/                      # pytest suite, 99% coverage on lab_corpus_mcp
 └── tmp/                        # local-iteration helpers (gitignored)
 ```
 
-## Tool surface (Phase 2B, 11 tools)
+## Tool surface (Phase 2B + U14, 13 tools)
 
 | Tool | Phase | Notes |
 |------|-------|-------|
@@ -86,6 +86,8 @@ lab-corpus-mcp/
 | `job_status` / `job_list` | 2A | delegate to `corpus_core.JobRegistry` |
 | `ingest_pdf` | 2B-1 | async; MinerU on one file (PDF/DOCX/PPTX/image) |
 | `ingest_local_dir` | 2B-1 | async; bulk ingest by glob, optional recursion |
+| `ingest_url` | 2B+ (U14) | async; download via `corpus_core.fetch_url` → MinerU. Any http(s) URL. |
+| `ingest_arxiv_pdf` | 2B+ (U14) | async; convenience for arxiv preprints — forces `paper_id = arxiv_id` |
 | `rebuild_index` | 2B-2 | async; delegates to `corpus_core.corpus_index.reindex` |
 | `search_paper_text` | 2B-2 | substring AND-scan over chunks |
 | `search_paper_semantic` | 2B-2 | cosine over chunk embeddings (Qwen3-4B-native default) |
@@ -94,8 +96,34 @@ lab-corpus-mcp/
 `paper_id` ∈ {DOI, sha256-of-file, arxiv_id-from-filename, user-supplied},
 distinguished by `paper_id_kind` in the `LabPaper` metadata sidecar.
 arxiv-id pattern (`\d{4}\.\d{4,5}`) wins on filename; otherwise sha256
-prefix of the file bytes. Explicit `paper_id` arg to `ingest_pdf`
-overrides both.
+prefix of the file bytes. Explicit `paper_id` arg to `ingest_pdf` /
+`ingest_url` overrides both.
+
+### Fetch-by-URL (U14, 2026-05-13)
+
+`ingest_pdf` / `ingest_local_dir` need a path on the server's
+filesystem — for fresh remote PDFs that meant `curl` + `docker cp` +
+`ingest_local_dir` (the s142 dogfood pain). The U14 tools collapse
+that to one MCP call:
+
+```jsonc
+// Arxiv preprint — paper_id forced to the arxiv id.
+{"tool": "ingest_arxiv_pdf", "args": {"arxiv_id": "2512.14129"}}
+// → {"job_id": "ef34ab…", "kind": "ingest_arxiv_pdf",
+//    "arxiv_id": "2512.14129", "backend": "pipeline"}
+
+// Generic URL — paper_id auto-derived from filename, or override.
+{"tool": "ingest_url",
+ "args": {"url": "https://example.org/preprints/ai4chem.pdf",
+          "paper_id": "ai4chem-2026"}}
+```
+
+Downloads land under `<parse.dir>/inbox/<filename>` via
+`corpus_core.http_fetch.fetch_url` (atomic write, 429/503 retry with
+`Retry-After`). arxiv.org URLs go through the singleton arxiv throttle
+so the combined image shares one 1 req / 3 sec budget between
+arxiv-radar's HTML/LaTeX fetcher and lab-corpus's PDF downloader —
+no double-spam. Closes arxiv-radar-mcp's U14.
 
 ## Combined mode — both backends on one Qwen
 
@@ -166,6 +194,12 @@ have VRAM headroom and want concurrent encode throughput.
   End-to-end smoke verified on arxiv:2512.14129 (Yin et al.,
   (Cr,Fe)S pyrrhotite) — 16 chunks indexed, `search_paper_text` and
   `search_paper_semantic` return correct hits.
+- **U14 fetch-by-URL done (2026-05-13):** new MCP tools `ingest_url`
+  and `ingest_arxiv_pdf` download remote PDFs server-side via
+  `corpus_core.http_fetch.fetch_url` and feed them straight into
+  the MinerU pipeline. Combined image shares one process-wide
+  `Throttle` instance for arxiv.org so both backends respect the
+  ToS 1 req / 3 sec budget without coordinating. 143 tests green.
 - **Phase 2B+ (deferred):** PDF-content DOI extraction (currently filename
   arxiv-id or sha256 prefix), slide / video loaders.
 

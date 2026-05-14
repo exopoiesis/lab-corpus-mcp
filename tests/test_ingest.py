@@ -15,8 +15,11 @@ import pytest
 
 from lab_corpus_mcp.ingest import (
     IngestError,
-    _default_mineru_runner,
     _copy_figures,
+    _default_mineru_runner,
+    _filename_from_url,
+    _is_arxiv_url,
+    fetch_and_ingest,
     ingest_dir,
     ingest_one,
     run_mineru,
@@ -288,3 +291,160 @@ def test_copy_figures_empty_dir(tmp_path):
     (md.parent / "images").mkdir()
     target = tmp_path / "figs"
     assert _copy_figures(md, target) is False
+
+
+# ----- U14: fetch_and_ingest + helpers ---------------------------------------
+
+def test_is_arxiv_url_positive():
+    assert _is_arxiv_url("https://arxiv.org/pdf/2410.04059")
+    assert _is_arxiv_url("https://arxiv.org/abs/2410.04059v2")
+    # Case-insensitive netloc
+    assert _is_arxiv_url("https://ARXIV.ORG/pdf/2410.04059")
+    # Future subdomain (e.g. export.arxiv.org)
+    assert _is_arxiv_url("https://export.arxiv.org/pdf/2410.04059")
+
+
+def test_is_arxiv_url_negative():
+    assert not _is_arxiv_url("https://example.com/pdf/2410.04059")
+    # Path-only mention of "arxiv.org" must NOT trigger the throttle.
+    assert not _is_arxiv_url("https://example.com/mirror/arxiv.org/x.pdf")
+    assert not _is_arxiv_url("https://notarxiv.org/x.pdf")
+
+
+def test_filename_from_url_explicit_paper_id():
+    assert _filename_from_url("https://example.com/x", "my-id") == "my-id.pdf"
+    # Even when URL already has its own extension, paper_id wins.
+    assert _filename_from_url("https://example.com/a.pdf", "my-id") == "my-id.pdf"
+
+
+def test_filename_from_url_uses_path_basename_when_extension_known():
+    assert _filename_from_url("https://example.com/papers/preprint.pdf", None) == "preprint.pdf"
+    assert _filename_from_url("https://example.com/a/b/slides.pptx", None) == "slides.pptx"
+
+
+def test_filename_from_url_arxiv_pdf_endpoint_adds_extension():
+    # arxiv.org/pdf/<id> has no extension on disk; the helper must add .pdf
+    # so derive_paper_id recognises the arxiv pattern on the stem.
+    assert _filename_from_url("https://arxiv.org/pdf/2410.04059", None) == "2410.04059.pdf"
+    assert _filename_from_url("https://arxiv.org/abs/2410.04059", None) == "2410.04059.pdf"
+
+
+def test_filename_from_url_hash_fallback_for_extensionless_generic():
+    """No paper_id, non-arxiv host, no recognized extension → url-hash fallback.
+
+    Output must be deterministic for a given URL (sha1 of the URL string).
+    """
+    name = _filename_from_url("https://example.com/messy/?id=42", None)
+    assert name.startswith("url-")
+    assert name.endswith(".pdf")
+    # Deterministic
+    again = _filename_from_url("https://example.com/messy/?id=42", None)
+    assert name == again
+
+
+def test_fetch_and_ingest_rejects_bad_scheme(tmp_path):
+    with pytest.raises(IngestError, match="invalid url"):
+        fetch_and_ingest("ftp://example.com/x", tmp_path / "parsed",
+                         runner=lambda *a, **kw: None)
+
+
+def _ok_fetcher(body: bytes = b"%PDF-1.4 dummy"):
+    """Factory: build a fetcher that writes `body` and records call kwargs."""
+    from corpus_core.http_fetch import FetchResult
+    captured: dict = {}
+
+    def _fetch(url, dest_path, *, throttle, timeout_s):
+        captured["url"] = url
+        captured["dest_path"] = Path(dest_path)
+        captured["throttle"] = throttle
+        captured["timeout_s"] = timeout_s
+        dest_path.parent.mkdir(parents=True, exist_ok=True)
+        dest_path.write_bytes(body)
+        return FetchResult(
+            url=url, dest_path=Path(dest_path),
+            ok=True, status=200, n_bytes=len(body), error=None,
+        )
+
+    return _fetch, captured
+
+
+def test_fetch_and_ingest_happy_path(tmp_path, fake_mineru_runner):
+    fetcher, captured = _ok_fetcher()
+    paper = fetch_and_ingest(
+        "https://example.com/papers/x.pdf",
+        tmp_path / "parsed",
+        runner=fake_mineru_runner,
+        fetcher=fetcher,
+    )
+    # Wrote to <parse_dir>/inbox/x.pdf
+    assert captured["dest_path"] == tmp_path / "parsed" / "inbox" / "x.pdf"
+    assert captured["throttle"] is None  # non-arxiv host
+    # ingest_one happened — markdown + meta exist
+    md = tmp_path / "parsed" / "sources" / f"{paper.paper_id}.md"
+    meta = tmp_path / "parsed" / "sources" / f"{paper.paper_id}.meta.json"
+    assert md.exists() and meta.exists()
+
+
+def test_fetch_and_ingest_arxiv_host_wires_singleton_throttle(
+    tmp_path, fake_mineru_runner,
+):
+    from corpus_core.http_fetch import get_arxiv_throttle
+    fetcher, captured = _ok_fetcher()
+    paper = fetch_and_ingest(
+        "https://arxiv.org/pdf/2410.04059",
+        tmp_path / "parsed",
+        runner=fake_mineru_runner,
+        fetcher=fetcher,
+    )
+    assert captured["throttle"] is get_arxiv_throttle()
+    # paper_id derived from arxiv-id pattern on filename
+    assert paper.paper_id == "2410.04059"
+    assert paper.paper_id_kind == "arxiv_id"
+
+
+def test_fetch_and_ingest_explicit_paper_id_propagates(tmp_path, fake_mineru_runner):
+    fetcher, captured = _ok_fetcher()
+    paper = fetch_and_ingest(
+        "https://example.com/messy/?id=42",
+        tmp_path / "parsed",
+        paper_id="custom-7",
+        runner=fake_mineru_runner,
+        fetcher=fetcher,
+    )
+    assert captured["dest_path"].name == "custom-7.pdf"
+    assert paper.paper_id == "custom-7"
+    assert paper.paper_id_kind == "user_supplied"
+
+
+def test_fetch_and_ingest_propagates_fetch_failure(tmp_path):
+    from corpus_core.http_fetch import FetchResult
+
+    def _fail(url, dest_path, *, throttle, timeout_s):
+        return FetchResult(
+            url=url, dest_path=None, ok=False,
+            status=503, n_bytes=0, error="http 503",
+        )
+
+    with pytest.raises(IngestError, match="fetch failed"):
+        fetch_and_ingest(
+            "https://example.com/x.pdf",
+            tmp_path / "parsed",
+            runner=lambda *a, **kw: None,
+            fetcher=_fail,
+        )
+
+
+def test_fetch_and_ingest_propagates_mineru_failure(tmp_path):
+    """Successful fetch + failing MinerU surfaces IngestError unchanged."""
+    fetcher, _ = _ok_fetcher()
+
+    def _boom(*_a, **_kw):
+        raise IngestError("simulated parse failure")
+
+    with pytest.raises(IngestError, match="simulated"):
+        fetch_and_ingest(
+            "https://example.com/x.pdf",
+            tmp_path / "parsed",
+            runner=_boom,
+            fetcher=fetcher,
+        )

@@ -1,6 +1,6 @@
 """MCP server for lab-corpus-mcp — built on `corpus_core.mcp_scaffold`.
 
-Phase 2B tool surface (11 tools):
+Phase 2B tool surface (13 tools):
 
   Skeleton (Phase 2A):
     * `corpus_stats`      — coarse health: parsed / indexed / model.
@@ -10,6 +10,10 @@ Phase 2B tool surface (11 tools):
   Ingest (Phase 2B-1):
     * `ingest_pdf`        — submit MinerU-driven ingest of one PDF/DOCX/...
     * `ingest_local_dir`  — bulk ingest of every matching file in a dir.
+
+  Fetch-by-URL (Phase 2B+, U14 — 2026-05-13):
+    * `ingest_url`        — download a URL into <parse.dir>/inbox/ then MinerU.
+    * `ingest_arxiv_pdf`  — convenience over ingest_url for arxiv preprints.
 
   Index + search (Phase 2B-2):
     * `rebuild_index`     — submit corpus_core.corpus_index.reindex job.
@@ -30,8 +34,13 @@ from __future__ import annotations
 
 import asyncio
 import logging
+import re
 from pathlib import Path
 from typing import Any
+
+# Strict arxiv-id validator for the `ingest_arxiv_pdf` tool: must be the
+# canonical post-2007 form, optionally with a vN revision suffix.
+_ARXIV_ID_RE = re.compile(r"^\d{4}\.\d{4,5}(?:v\d+)?$")
 
 from corpus_core.corpus_index import (
     FULLTEXT_MAX_SEQ_LENGTH,
@@ -53,7 +62,13 @@ from corpus_core.mcp_scaffold import (
 
 from lab_corpus_mcp.config import Config, load
 from lab_corpus_mcp.corpus import LabPaper, load_lab_papers
-from lab_corpus_mcp.ingest import IngestError, MineruRunner, ingest_dir, ingest_one
+from lab_corpus_mcp.ingest import (
+    IngestError,
+    MineruRunner,
+    fetch_and_ingest,
+    ingest_dir,
+    ingest_one,
+)
 
 LOG = logging.getLogger(__name__)
 
@@ -278,6 +293,54 @@ class LabCorpusServer:
         return {"job_id": job_id, "kind": "ingest_local_dir",
                 "n_total": n_total, "backend": backend_eff}
 
+    def ingest_url(self, url: str, paper_id: str | None = None,
+                   backend: str | None = None) -> dict:
+        """Submit a background download-and-ingest job. Returns {job_id}.
+
+        The URL is fetched via ``corpus_core.http_fetch.fetch_url`` —
+        arxiv.org hosts share the module-global 1 req / 3 sec throttle
+        with the arxiv-radar fetcher when both run in one process
+        (combined image). Other hosts are not rate-limited.
+
+        After download the file is parsed with MinerU exactly like
+        ``ingest_pdf`` (same backend choice / paper_id derivation).
+        """
+        if not url or not isinstance(url, str) or not url.startswith(("http://", "https://")):
+            return {"error": f"invalid url: {url!r}"}
+        from lab_corpus_mcp.ingest import DEFAULT_BACKEND
+        backend_eff = backend or DEFAULT_BACKEND
+        job_id = self.jobs.submit(
+            kind="ingest_url",
+            fn=lambda h: self._do_ingest_url(h, url, paper_id, backend_eff),
+            args={"url": url, "paper_id": paper_id, "backend": backend_eff},
+            n_total=1,
+        )
+        return {"job_id": job_id, "kind": "ingest_url", "backend": backend_eff}
+
+    def ingest_arxiv_pdf(self, arxiv_id: str,
+                         backend: str | None = None) -> dict:
+        """Convenience wrapper: download arxiv.org/pdf/<arxiv_id> and ingest.
+
+        Equivalent to ``ingest_url(url='https://arxiv.org/pdf/<id>',
+        paper_id=<id>)`` — but presents as its own job kind so dashboards
+        / `job_list` make the arxiv-specific origin obvious. Closes the
+        s142 dogfood gap where users had to curl + docker cp + ingest_local_dir
+        for fresh PDF-only arxiv papers.
+        """
+        if not arxiv_id or not isinstance(arxiv_id, str) or not _ARXIV_ID_RE.match(arxiv_id):
+            return {"error": f"invalid arxiv_id: {arxiv_id!r}"}
+        from lab_corpus_mcp.ingest import DEFAULT_BACKEND
+        backend_eff = backend or DEFAULT_BACKEND
+        url = f"https://arxiv.org/pdf/{arxiv_id}"
+        job_id = self.jobs.submit(
+            kind="ingest_arxiv_pdf",
+            fn=lambda h: self._do_ingest_url(h, url, arxiv_id, backend_eff),
+            args={"arxiv_id": arxiv_id, "backend": backend_eff},
+            n_total=1,
+        )
+        return {"job_id": job_id, "kind": "ingest_arxiv_pdf",
+                "arxiv_id": arxiv_id, "backend": backend_eff}
+
     def rebuild_index(self, force_full: bool = False) -> dict:
         """Submit a background reindex of the parsed-corpus tree."""
         sources_dir = self.parse_dir / "sources"
@@ -341,6 +404,25 @@ class LabCorpusServer:
         # Reload papers map — bulk ingest may have added many.
         self.papers = load_lab_papers(self.parse_dir)
         return result
+
+    def _do_ingest_url(self, handle: JobHandle, url: str,
+                       paper_id: str | None, backend: str) -> dict:
+        try:
+            paper = fetch_and_ingest(
+                url, self.parse_dir,
+                paper_id=paper_id, backend=backend, runner=self.mineru_runner,
+            )
+        except IngestError as e:
+            raise JobError(str(e)) from e
+        self.papers[paper.paper_id] = paper
+        handle.update(n_done=1)
+        return {
+            "paper_id": paper.paper_id,
+            "n_chars": paper.n_chars,
+            "title": paper.title,
+            "source_kind": paper.source_kind,
+            "url": url,
+        }
 
     def _do_reindex(self, handle: JobHandle, *, force_full: bool = False) -> dict:
         try:
@@ -502,6 +584,69 @@ LAB_TOOL_SPECS: list[dict[str, Any]] = [
                 },
             },
             "required": ["dir_path"],
+        },
+    },
+    # ----- fetch-by-URL (Phase 2B+, U14) -----------------------------------
+    {
+        "name": "ingest_url",
+        "description": (
+            "Download a remote document and ingest it. Async — returns "
+            "{job_id} immediately; poll with job_status. Works for any "
+            "http(s) URL (preprint server, journal supplement, OSF, "
+            "personal page). The download lands in `<parse.dir>/inbox/` "
+            "and is then parsed by MinerU exactly like `ingest_pdf`. "
+            "arxiv.org URLs share the module-global 1 req / 3 sec "
+            "throttle with the arxiv-radar fetcher (combined image). "
+            "Pass `paper_id` to override the auto-derived id "
+            "(useful when you already know a DOI / arxiv id)."
+        ),
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "url": {
+                    "type": "string",
+                    "description": "Absolute http(s) URL to fetch.",
+                },
+                "paper_id": {
+                    "type": "string",
+                    "description": "Optional explicit id. Defaults to "
+                                   "filename-arxiv-id or sha256 prefix.",
+                },
+                "backend": {
+                    "type": "string",
+                    "enum": ["pipeline", "vlm-transformers"],
+                    "description": "MinerU backend (default: pipeline).",
+                },
+            },
+            "required": ["url"],
+        },
+    },
+    {
+        "name": "ingest_arxiv_pdf",
+        "description": (
+            "Convenience wrapper over `ingest_url` for arxiv preprints. "
+            "Downloads `https://arxiv.org/pdf/<arxiv_id>` and ingests "
+            "with `paper_id=<arxiv_id>`. Closes the s142 dogfood gap "
+            "where PDF-only arxiv papers required manual curl + "
+            "docker cp + ingest_local_dir. Async — returns {job_id}."
+        ),
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "arxiv_id": {
+                    "type": "string",
+                    "description": "Canonical post-2007 arxiv id "
+                                   "(e.g. `2512.14129`). Optional `vN` "
+                                   "revision suffix allowed.",
+                    "pattern": r"^\d{4}\.\d{4,5}(v\d+)?$",
+                },
+                "backend": {
+                    "type": "string",
+                    "enum": ["pipeline", "vlm-transformers"],
+                    "description": "MinerU backend (default: pipeline).",
+                },
+            },
+            "required": ["arxiv_id"],
         },
     },
     # ----- index + search (Phase 2B-2) ------------------------------------

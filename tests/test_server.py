@@ -31,6 +31,8 @@ EXPECTED_TOOLS = {
     "corpus_stats", "list_corpus", "paper_info", "job_status", "job_list",
     # Phase 2B-1 ingest
     "ingest_pdf", "ingest_local_dir",
+    # Phase 2B+ U14 fetch-by-URL
+    "ingest_url", "ingest_arxiv_pdf",
     # Phase 2B-2 index + search
     "rebuild_index", "search_paper_text", "search_paper_semantic", "similar_to_paper",
 }
@@ -76,7 +78,7 @@ def test_no_arxiv_radar_tools_leak_through():
 
 def test_tool_names_helper_matches_specs():
     assert set(_tool_names()) == EXPECTED_TOOLS
-    assert len(_tool_names()) == len(LAB_TOOL_SPECS) == 11
+    assert len(_tool_names()) == len(LAB_TOOL_SPECS) == 13
 
 
 # ----- _dispatch -------------------------------------------------------------
@@ -105,6 +107,14 @@ class _StubLab:
     def ingest_local_dir(self, dir_path, glob="*.pdf", recursive=False):
         return {"called": "ingest_local_dir", "dir": dir_path, "glob": glob,
                 "recursive": recursive}
+
+    def ingest_url(self, url, paper_id=None, backend=None):
+        return {"called": "ingest_url", "url": url,
+                "paper_id": paper_id, "backend": backend}
+
+    def ingest_arxiv_pdf(self, arxiv_id, backend=None):
+        return {"called": "ingest_arxiv_pdf", "arxiv_id": arxiv_id,
+                "backend": backend}
 
     def rebuild_index(self, force_full=False):
         return {"called": "rebuild_index", "force_full": force_full}
@@ -419,6 +429,185 @@ def test_ingest_local_dir_bulk(lab_config, tmp_path, fake_mineru_runner):
         srv.jobs.shutdown()
 
 
+# ----- ingest_url / ingest_arxiv_pdf (U14) -----------------------------------
+
+def _make_fake_fetcher(body: bytes = b"%PDF-1.4 fake remote bytes"):
+    """Return (fetcher, captured) — fetcher writes `body` to dest_path,
+    returns a successful FetchResult, and records its kwargs."""
+    from corpus_core.http_fetch import FetchResult
+    captured: dict = {}
+
+    def _fetcher(url, dest_path, *, throttle, timeout_s):
+        captured["url"] = url
+        captured["dest_path"] = Path(dest_path)
+        captured["throttle"] = throttle
+        captured["timeout_s"] = timeout_s
+        dest_path.parent.mkdir(parents=True, exist_ok=True)
+        dest_path.write_bytes(body)
+        return FetchResult(
+            url=url, dest_path=Path(dest_path),
+            ok=True, status=200, n_bytes=len(body), error=None,
+        )
+
+    return _fetcher, captured
+
+
+def _patch_fetcher(monkeypatch, fetcher):
+    """Replace `corpus_core.http_fetch.fetch_url` for the test."""
+    monkeypatch.setattr("lab_corpus_mcp.ingest.fetch_url", fetcher)
+
+
+def test_ingest_url_rejects_bad_scheme(lab_config):
+    srv = LabCorpusServer(lab_config)
+    try:
+        out = srv.ingest_url(url="ftp://example.com/x.pdf")
+        assert "error" in out and "invalid url" in out["error"]
+    finally:
+        srv.jobs.shutdown()
+
+
+def test_ingest_url_rejects_empty_url(lab_config):
+    srv = LabCorpusServer(lab_config)
+    try:
+        assert "error" in srv.ingest_url(url="")
+    finally:
+        srv.jobs.shutdown()
+
+
+def test_ingest_url_happy_path(monkeypatch, lab_config, fake_mineru_runner):
+    """Generic non-arxiv URL → no arxiv throttle, file lands in inbox,
+    MinerU parses, paper persisted."""
+    fetcher, captured = _make_fake_fetcher()
+    _patch_fetcher(monkeypatch, fetcher)
+
+    srv = LabCorpusServer(lab_config, mineru_runner=fake_mineru_runner)
+    try:
+        result = srv.ingest_url(url="https://example.com/preprint.pdf")
+        assert "job_id" in result
+        info = _wait_for_terminal(srv, result["job_id"])
+        assert info["state"] == "done", info
+        assert info["result"]["url"] == "https://example.com/preprint.pdf"
+        # filename derived from URL last segment (has .pdf extension)
+        assert captured["dest_path"].name == "preprint.pdf"
+        # non-arxiv host → no rate limit
+        assert captured["throttle"] is None
+        # File landed in <parse.dir>/inbox/
+        assert captured["dest_path"].parent == lab_config.parse.dir / "inbox"
+        # And ingest_one then wrote a parsed markdown under sources/
+        assert srv.corpus_stats()["n_parsed"] == 1
+    finally:
+        srv.jobs.shutdown()
+
+
+def test_ingest_url_explicit_paper_id_dictates_filename(
+    monkeypatch, lab_config, fake_mineru_runner,
+):
+    fetcher, captured = _make_fake_fetcher()
+    _patch_fetcher(monkeypatch, fetcher)
+
+    srv = LabCorpusServer(lab_config, mineru_runner=fake_mineru_runner)
+    try:
+        result = srv.ingest_url(
+            url="https://example.com/messy/?id=42",
+            paper_id="my-paper",
+        )
+        info = _wait_for_terminal(srv, result["job_id"])
+        assert info["state"] == "done", info
+        assert info["result"]["paper_id"] == "my-paper"
+        # filename = `<paper_id>.pdf`
+        assert captured["dest_path"].name == "my-paper.pdf"
+    finally:
+        srv.jobs.shutdown()
+
+
+def test_ingest_url_fetch_failure_marks_job_failed(monkeypatch, lab_config):
+    """Non-2xx response → IngestError → JobError → state == failed."""
+    from corpus_core.http_fetch import FetchResult
+
+    def _fetcher(url, dest_path, *, throttle, timeout_s):
+        return FetchResult(
+            url=url, dest_path=None,
+            ok=False, status=404, n_bytes=0, error="http 404",
+        )
+
+    _patch_fetcher(monkeypatch, _fetcher)
+
+    srv = LabCorpusServer(lab_config)
+    try:
+        result = srv.ingest_url(url="https://example.com/missing.pdf")
+        info = _wait_for_terminal(srv, result["job_id"])
+        assert info["state"] == "failed"
+        assert "404" in info["error"]
+    finally:
+        srv.jobs.shutdown()
+
+
+def test_ingest_arxiv_pdf_rejects_invalid_id(lab_config):
+    srv = LabCorpusServer(lab_config)
+    try:
+        for bad in ("not-an-id", "1234", "12345.6789", ""):
+            out = srv.ingest_arxiv_pdf(arxiv_id=bad)
+            assert "error" in out, f"unexpectedly accepted: {bad!r}"
+            assert "invalid arxiv_id" in out["error"]
+    finally:
+        srv.jobs.shutdown()
+
+
+def test_ingest_arxiv_pdf_accepts_with_revision(lab_config):
+    """Canonical `<id>` and `<id>vN` both validate."""
+    from corpus_core.http_fetch import FetchResult
+
+    def _fetcher(url, dest_path, *, throttle, timeout_s):
+        dest_path.parent.mkdir(parents=True, exist_ok=True)
+        dest_path.write_bytes(b"%PDF-1.4 dummy")
+        return FetchResult(
+            url=url, dest_path=Path(dest_path),
+            ok=True, status=200, n_bytes=10, error=None,
+        )
+
+    import lab_corpus_mcp.ingest as ing
+    ing_real = ing.fetch_url
+    ing.fetch_url = _fetcher
+    try:
+        srv = LabCorpusServer(lab_config)
+        try:
+            out = srv.ingest_arxiv_pdf(arxiv_id="2512.14129v2")
+            assert "job_id" in out
+            assert out["arxiv_id"] == "2512.14129v2"
+        finally:
+            srv.jobs.shutdown()
+    finally:
+        ing.fetch_url = ing_real
+
+
+def test_ingest_arxiv_pdf_uses_arxiv_throttle_and_url(
+    monkeypatch, lab_config, fake_mineru_runner,
+):
+    """arxiv URL → arxiv throttle wired; filename = <id>.pdf;
+    paper_id == arxiv_id."""
+    from corpus_core.http_fetch import get_arxiv_throttle
+    fetcher, captured = _make_fake_fetcher()
+    _patch_fetcher(monkeypatch, fetcher)
+
+    srv = LabCorpusServer(lab_config, mineru_runner=fake_mineru_runner)
+    try:
+        result = srv.ingest_arxiv_pdf(arxiv_id="2512.14129")
+        assert result["arxiv_id"] == "2512.14129"
+        assert result["kind"] == "ingest_arxiv_pdf"
+        info = _wait_for_terminal(srv, result["job_id"])
+        assert info["state"] == "done", info
+        # paper_id forced to the arxiv id, not the sha256 fallback
+        assert info["result"]["paper_id"] == "2512.14129"
+        # URL composed correctly
+        assert captured["url"] == "https://arxiv.org/pdf/2512.14129"
+        # arxiv host → shared singleton throttle is wired in
+        assert captured["throttle"] is get_arxiv_throttle()
+        # Filename matches the paper_id rule
+        assert captured["dest_path"].name == "2512.14129.pdf"
+    finally:
+        srv.jobs.shutdown()
+
+
 # ----- rebuild_index ---------------------------------------------------------
 
 def test_rebuild_index_no_papers(lab_config):
@@ -701,7 +890,7 @@ def test_build_mcp_app_constructs_server(lab_config):
     try:
         app = _build_mcp_app(srv)
         assert app is not None
-        assert len(LAB_TOOL_SPECS) == 11
+        assert len(LAB_TOOL_SPECS) == 13
     finally:
         srv.jobs.shutdown()
 
