@@ -31,18 +31,23 @@ bash scripts/docker_build.sh
 bash scripts/docker_download_models.sh
 ```
 
-After this, two named docker volumes exist on gomer:
-* `lab-corpus-hf` — sentence-transformers / transformers / Qwen
-* `lab-corpus-ms` — MinerU layout / OCR / VLM models
+After this, four named docker volumes exist on gomer:
+
+| Volume | Mount inside container | What it holds |
+|---|---|---|
+| `arxiv-radar-cache` | `/cache` | arxiv-radar `radar.toml` + `abstracts/` (~370 MB embeddings) + `fulltext/` + `sources/<domain>/` (5 sparse-clone repos) + `jobs/`. Survives container restarts and config edits. |
+| `lab-corpus-cache` | `/srv/lab-corpus` | lab-corpus `radar.toml` + `parsed/{sources,figures,inbox}/` + `cache/{embeddings,jobs}/`. Created by `docker_init_volume.sh` with empty subdirs; populated on first ingest. |
+| `arxiv-radar-hf` | `/root/.cache/huggingface` | Qwen3-Embedding-4B weights (~8 GB). Pulled once on first warm-up, then reused — never re-downloaded across restarts. |
+| `lab-corpus-ms` | `/root/.cache/modelscope` | MinerU layout / OCR / MFR / table models (~2-3 GB). Pulled by `docker_download_models.sh` or on first ingest. |
+
+The four-volume split keeps stable assets (model weights) separate
+from growable data (indexes, parsed PDFs), and arxiv vs lab corpora
+separate so either can be backed up / restored independently. The HF
+volume is named `arxiv-radar-hf` (legacy from when arxiv-radar shipped
+standalone) but is shared by both backends in the combined image —
+one Qwen copy on disk.
 
 These persist across container restarts so we never re-download.
-
-> **Sharing the HF volume with a legacy arxiv-radar-backend.** If you
-> already have an `arxiv-radar-backend` container on the host using
-> `arxiv-radar-hf` for its Qwen weights, point `docker_serve_combined.sh`
-> at the SAME volume name (the script accepts `-v arxiv-radar-hf:...`)
-> instead of `lab-corpus-hf`. That way Qwen3-4B weights stay at one
-> copy on the host disk during the migration window.
 
 ## Migrating from a legacy arxiv-radar-backend
 
@@ -146,6 +151,25 @@ slightly lower but still extracts title, abstract, sections, formulas,
 and figures cleanly. Pass `backend="vlm-transformers"` per-call if you
 have GPU headroom and want higher fidelity.
 
+**MinerU library mode (s153, 2026-05-24).** Ingest calls
+`mineru.cli.common.do_parse(...)` directly from the lab-corpus-mcp
+Python process — no `mineru` CLI subprocess, no transient FastAPI
+server. MinerU's `AtomModelSingleton` (layout + OCR + MFR + table)
+lives in-process across calls, so a bulk `ingest_local_dir` of N PDFs
+pays the ~30 sec model load **once** for the whole batch. After the
+batch, `_release_gpu_vram` clears the singletons via
+`unload_mineru_models()` so the host's GPU returns to ~0 MiB used.
+
+This trades the previous subprocess-per-PDF cleanup model for explicit
+in-process control:
+* **Win:** bulk ingest of 10 PDFs ~22% faster (one cold-load instead
+  of ten); no granchild process to leak under SIGKILL.
+* **Win:** Encoder + MinerU both controlled by the same release path
+  (`_release_gpu_vram`), so end-of-job GPU state is consistent.
+* **Trade:** single-PDF ingest after a long idle still pays full
+  cold-load; if you optimise for one-shot latency rather than bulk
+  throughput, the difference vanishes.
+
 Per ingested file this writes:
 * `<parse.dir>/sources/<paper_id>.md` — flat markdown (MinerU output).
 * `<parse.dir>/sources/<paper_id>.meta.json` — `LabPaper` sidecar
@@ -184,26 +208,43 @@ container instead of two separate ones — Qwen3-4B is ~8 GB in bf16,
 so two copies don't fit in 12 GB VRAM. The combined supervisor in
 `lab_corpus_mcp.combined` boots both servers in one process, hands
 them the same `Encoder`, and serializes encode calls with a
-`threading.Lock` (peak VRAM ≈ 10 GB).
+`threading.Lock` (peak VRAM ≈ 10 GB while loaded; ~0 GB after
+`_release_gpu_vram` between jobs).
+
+Production deploy uses **named volumes only** (no host bind-mounts —
+data lives inside Docker, survives WSL distro resets):
 
 ```bash
-# Start the long-lived container (auto-restart, two ports exposed)
-bash scripts/docker_serve_combined.sh \
-    /srv/arxiv-radar/radar.toml \
-    /srv/lab-corpus/radar.toml \
-    /srv/arxiv-radar/cache/sources \
-    /srv/arxiv-radar/cache \
-    /srv/lab-corpus/cache
+docker --context gomer run -d \
+    --name lab-corpus-combined \
+    --restart unless-stopped \
+    --gpus all \
+    -p 18765:8765 -p 18766:8766 \
+    -e ARXIV_CONFIG=/cache/radar.toml \
+    -e LAB_CONFIG=/srv/lab-corpus/radar.toml \
+    -v arxiv-radar-cache:/cache \
+    -v lab-corpus-cache:/srv/lab-corpus \
+    -v arxiv-radar-hf:/root/.cache/huggingface \
+    -v lab-corpus-ms:/root/.cache/modelscope \
+    exopoiesis/lab-corpus-gpu:latest combined
 
-# Watch logs (expect three index-load lines + supervisor banner)
+# Watch startup (expect index-load lines + supervisor banner + warm-up)
 docker --context gomer logs -f lab-corpus-combined
 ```
 
-Both backends now reachable on gomer at `:8765` (arxiv-radar) and
-`:8766` (lab-corpus). When migrating from a legacy
-`arxiv-radar-backend` that already binds `:8765`, deploy the combined
-container on alternate ports (e.g. `127.0.0.1:18765` + `:18766`) until
-you cut over.
+Host port mapping `18765:8765` + `18766:8766` matches the production
+`.mcp.json` proxy config (`--remote gomer --remote-port 18765`). The
+container exposes `:8765` (arxiv) / `:8766` (lab) internally.
+
+`ARXIV_CONFIG=/cache/radar.toml` points at the `radar.toml` that
+already lives inside the `arxiv-radar-cache` volume — written there
+once by `docker_init_volume.sh` in arxiv-radar-mcp, never edited from
+the host filesystem. Lab-corpus follows the same pattern with
+`/srv/lab-corpus/radar.toml` inside `lab-corpus-cache`.
+
+The older `scripts/docker_serve_combined.sh` (host-bind variant) is
+kept for legacy compatibility but the named-volume invocation above
+is the canonical production setup.
 
 For Claude Desktop, run two **stdio→HTTP proxies** (one per backend)
 over an SSH tunnel:
@@ -329,6 +370,13 @@ public repo's "feed reader" pattern). What stays here:
     ingest_local_dir workflow that surfaced in the s142 dogfood.
     arxiv hosts share the singleton 1 req / 3 sec throttle with
     arxiv-radar's HTML/LaTeX fetcher in the combined image.
+2b. ✅ **MinerU library mode + GPU unload** (s153, 2026-05-24). Switched
+    ingest from `subprocess.run(["mineru", ...])` to direct
+    `mineru.cli.common.do_parse(...)` library call. Added
+    `unload_mineru_models()` and `LabCorpusServer._release_gpu_vram()`
+    which clears both Encoder and MinerU singletons after every
+    ingest / reindex job, so the shared RTX 4070 on gomer is free
+    for unrelated compute between batches.
 3. ⏳ **PDF-content DOI extraction** — currently filename-based
    arxiv-id pattern + sha256 fallback. Adding pypdf-based DOI lookup
    to fill in `paper_id_kind="doi"` for arxiv-less PDFs.

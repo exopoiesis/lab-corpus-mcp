@@ -80,6 +80,17 @@ class _LockedEncoder:
                 batch_size=batch_size,
             )
 
+    def unload(self) -> bool:
+        """Drop the shared inner Encoder's model + free VRAM.
+
+        Taken from the same lock as `encode_*` so a concurrent encode
+        either runs first or, after this call, triggers a lazy re-load.
+        Use after rebuild_index / bulk ingest finishes when the host's
+        GPU is also being used for unrelated compute.
+        """
+        with self._lock:
+            return self._inner.unload()
+
     def __getattr__(self, name: str) -> Any:
         # Last-resort attribute proxy for anything we forgot to mirror
         # (e.g. `config`). Bypassed when the attribute is set directly

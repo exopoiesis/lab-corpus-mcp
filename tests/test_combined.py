@@ -116,6 +116,68 @@ def test_locked_encoder_returns_inner_result():
     assert out.shape == (4,)
 
 
+def test_locked_encoder_unload_proxies_to_inner():
+    """unload() must call through to the wrapped encoder."""
+    class _UnloadableInner(_RecordingEncoder):
+        def __init__(self):
+            super().__init__()
+            self.unload_calls = 0
+
+        def unload(self) -> bool:
+            self.unload_calls += 1
+            return True
+
+    inner = _UnloadableInner()
+    locked = _LockedEncoder(inner)
+    assert locked.unload() is True
+    assert inner.unload_calls == 1
+
+
+def test_locked_encoder_unload_serializes_with_encode():
+    """A pending encode must complete before unload runs (same lock).
+
+    We start an encode_query in a worker thread, then on the main thread
+    call unload(). The unload must wait for the encode to finish — once
+    it returns, the inner.unload_calls counter should be 1 AND the
+    encode should already have left in_flight (i.e. no overlap).
+    """
+    overlap_seen = {"flag": False}
+
+    class _SlowUnloadable(_RecordingEncoder):
+        def __init__(self):
+            super().__init__()
+            self.unload_calls = 0
+
+        def encode_query(self, text, max_seq_length=512):
+            self._enter(f"q:{text}")
+            # Hold the lock long enough for the unload thread to queue.
+            time.sleep(0.1)
+            self._leave()
+            return np.zeros(4, dtype=np.float32)
+
+        def unload(self) -> bool:
+            # If we were called while an encode was in flight that's a
+            # serialization bug — record it.
+            if self.in_flight > 0:
+                overlap_seen["flag"] = True
+            self.unload_calls += 1
+            return True
+
+    inner = _SlowUnloadable()
+    locked = _LockedEncoder(inner)
+
+    encoder_thread = threading.Thread(target=lambda: locked.encode_query("x"))
+    encoder_thread.start()
+    # Give the encode time to start so unload() actually has to queue.
+    time.sleep(0.02)
+    locked.unload()
+    encoder_thread.join()
+
+    assert inner.unload_calls == 1
+    assert overlap_seen["flag"] is False, (
+        "unload ran while encode was still in flight — lock not held")
+
+
 # ----- _assert_models_agree --------------------------------------------------
 
 class _FakeEmbeddingsCfg:

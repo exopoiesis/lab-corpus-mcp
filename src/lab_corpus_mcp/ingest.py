@@ -1,7 +1,7 @@
 """MinerU-driven ingest pipeline.
 
 Phase 2B-1 surface:
-  * `run_mineru(pdf_path, out_dir, *, timeout)` — subprocess wrapper.
+  * `run_mineru(pdf_path, out_dir, *, timeout)` — library wrapper.
   * `ingest_one(file_path, parse_dir, *, paper_id=None)` — full ingest
     of a single file: run MinerU, normalize output, write
     `<parse.dir>/sources/<paper_id>.md` + `<paper_id>.meta.json`,
@@ -16,11 +16,20 @@ Phase 2B+ U14 surface (2026-05-13):
     `ingest_arxiv_pdf` MCP tools to close the s142 dogfood gap (no
     server-side fetch-by-URL).
 
-The MinerU CLI (`mineru -p <input> -o <out>`) is the only external
-dependency; tests stub it with a fake that just writes a markdown
-stub, so the orchestration logic is fully covered without a 2 GB
-install. Real ingest happens on the gomer GPU host inside the Docker
-image (see `lab-corpus-mcp/Dockerfile`).
+s153 (2026-05-24): Switched from `subprocess.run(["mineru", ...])` to
+direct Python library calls (`mineru.cli.common.do_parse`). The old
+subprocess path had two costs: (1) ~30 sec model cold-load on every
+PDF because the granchild `LocalAPIServer` died at the end of each CLI
+call; (2) HTTP overhead between CLI and LocalAPIServer. Library mode
+loads MinerU's `AtomModelSingleton` once into the lab-corpus-mcp process
+and reuses it for the whole batch. The trade-off — MinerU's GPU weights
+now share VRAM with our Qwen3 encoder — is mitigated by
+`unload_mineru_models()` called from the same `_release_gpu_vram` path
+that handles `Encoder.unload()`.
+
+The `MineruRunner` injection point stays compatible: tests can still
+pass a fake runner that just writes a stub markdown without ever
+importing MinerU.
 """
 from __future__ import annotations
 
@@ -28,7 +37,6 @@ import hashlib
 import logging
 import os
 import shutil
-import subprocess
 import tempfile
 from dataclasses import asdict, replace
 from pathlib import Path
@@ -76,26 +84,58 @@ def _default_mineru_runner(
     input_file: Path, output_dir: Path, timeout: int,
     *, backend: str = DEFAULT_BACKEND,
 ) -> Path:
-    """Real MinerU subprocess wrapper. Returns the produced markdown path.
+    """Real MinerU runner. Returns the produced markdown path.
 
-    MinerU 2.x writes to `<output_dir>/<stem>/auto/<stem>.md` plus
-    `<output_dir>/<stem>/auto/images/`. We probe that path first, then
-    fall back to a recursive search to absorb minor layout drifts.
+    Calls `mineru.cli.common.do_parse` directly — no subprocess, no HTTP.
+    MinerU's `AtomModelSingleton` lives in this process across calls, so
+    the second PDF in a batch pays no model-load cost. After the job
+    completes, `unload_mineru_models()` frees the singletons + VRAM.
+
+    Output layout matches the CLI: MinerU writes to
+    `<output_dir>/<stem>/<parse_method>/<stem>.md` plus
+    `<output_dir>/<stem>/<parse_method>/images/`. We probe the
+    `parse_method="auto"` path first, then fall back to a recursive
+    search to absorb minor layout drifts (e.g. when MinerU's auto
+    decided txt/ocr instead of auto, or future-version layout changes).
+
+    The `timeout` parameter is accepted for backward compatibility with
+    the test seam but no longer enforced — `do_parse` is a sync Python
+    call and the caller's job-registry already wraps execution with
+    its own watchdog. To re-introduce a hard timeout, wrap this call
+    in a worker thread with a join timeout.
     """
-    cmd = ["mineru", "-p", str(input_file), "-o", str(output_dir),
-           "-b", backend]
-    LOG.info(f"mineru: {' '.join(cmd)}")
-    proc = subprocess.run(
-        cmd, capture_output=True, text=True, timeout=timeout, check=False,
-    )
-    if proc.returncode != 0:
-        raise IngestError(
-            f"mineru failed (rc={proc.returncode}): "
-            f"{proc.stderr.strip() or proc.stdout.strip() or 'no output'}"
-        )
+    # Lazy import — keeps `from lab_corpus_mcp.ingest import ...` cheap
+    # for tests / cold callers that swap in a fake runner. Pulling
+    # mineru at module-import time would load torch + ~500 MB of
+    # transitive deps even when no real parsing is going to happen.
+    from mineru.cli.common import do_parse  # noqa: PLC0415
 
+    del timeout  # see docstring; no longer enforced here.
+
+    output_dir.mkdir(parents=True, exist_ok=True)
     stem = input_file.stem
-    candidate = output_dir / stem / "auto" / f"{stem}.md"
+    pdf_bytes = input_file.read_bytes()
+    parse_method = "auto"
+
+    LOG.info(f"mineru (library): parse {input_file.name} backend={backend}")
+    try:
+        do_parse(
+            output_dir=str(output_dir),
+            pdf_file_names=[stem],
+            pdf_bytes_list=[pdf_bytes],
+            p_lang_list=["ch"],   # match prior CLI default (was -l ch implicit)
+            backend=backend,
+            parse_method=parse_method,
+            formula_enable=True,
+            table_enable=True,
+        )
+    except Exception as e:  # noqa: BLE001
+        # MinerU surfaces a mix of RuntimeError / FileNotFoundError /
+        # backend-specific exceptions. Normalize to IngestError so the
+        # JobRegistry records a clean `failed` state.
+        raise IngestError(f"mineru library call failed: {type(e).__name__}: {e}") from e
+
+    candidate = output_dir / stem / parse_method / f"{stem}.md"
     if candidate.exists():
         return candidate
     # Layout drift fallback — pick the first .md MinerU produced under out_dir.
@@ -103,6 +143,67 @@ def _default_mineru_runner(
     if not fallbacks:
         raise IngestError(f"mineru produced no markdown under {output_dir}")
     return fallbacks[0]
+
+
+def unload_mineru_models() -> bool:
+    """Release MinerU's cached pipeline / hybrid model singletons.
+
+    Mirrors `corpus_core.embeddings.Encoder.unload()` so the lab-corpus
+    GPU clear-out is symmetric: after a batch ingest the host's GPU
+    holds neither our Qwen3 encoder nor MinerU's layout / OCR / MFR /
+    table models, freeing VRAM for unrelated compute (~6-8 GB +
+    ~2-3 GB respectively on a 12 GB RTX 4070).
+
+    Idempotent: returns True if anything was actually released, False
+    when no MinerU model had been loaded (e.g. a server that only
+    answered search queries this lifetime).
+
+    Implementation details:
+      * `AtomModelSingleton._models` is a class-level dict keyed by
+        (model_name, lang, device, ...) → instance. Clearing the dict
+        drops the last Python references; the next forward pass after
+        re-load picks up cleanly.
+      * MinerU does NOT expose a public unload API (see
+        `MinerU/mineru/backend/pipeline/model_init.py` — no .release()
+        or close() methods on the singleton classes). We use the
+        underscore-prefixed `_models` field directly. If a future
+        MinerU release adds a public hook we should switch to that.
+      * Import is lazy so this module is safe to import on hosts
+        without MinerU installed (e.g. dev laptop running unit tests).
+    """
+    import gc
+
+    try:
+        from mineru.backend.pipeline.model_init import (  # noqa: PLC0415
+            AtomModelSingleton,
+            HybridModelSingleton,
+        )
+    except ImportError:
+        # MinerU isn't installed — nothing to unload, nothing to fail on.
+        return False
+
+    released_any = False
+    for singleton_cls in (AtomModelSingleton, HybridModelSingleton):
+        cached = getattr(singleton_cls, "_models", None)
+        if cached:
+            released_any = True
+            cached.clear()
+
+    if not released_any:
+        return False
+
+    gc.collect()
+    try:
+        import torch  # noqa: PLC0415
+
+        if torch.cuda.is_available():
+            torch.cuda.empty_cache()
+            torch.cuda.ipc_collect()
+    except ImportError:
+        pass
+
+    LOG.info("unloaded MinerU pipeline + hybrid model singletons")
+    return True
 
 
 def run_mineru(
@@ -232,7 +333,7 @@ def ingest_dir(
                 "paper_id": paper.paper_id,
                 "n_chars": paper.n_chars,
             })
-        except (IngestError, subprocess.TimeoutExpired) as e:
+        except IngestError as e:
             failed.append({"input": str(inp), "error": str(e)})
         if progress_cb is not None:
             progress_cb(i + 1, len(inputs))

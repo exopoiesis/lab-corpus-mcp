@@ -34,15 +34,17 @@ embedding stack.
               ┌──────────────────────────────────────────┐
               │   lab-corpus-mcp Docker image (gomer)    │
               │ ┌──────────────────────────────────────┐ │
-              │ │ MinerU 2.x (PDF → md + figures)      │ │
+              │ │ MinerU 2.x — library mode (s153)     │ │
+              │ │   do_parse() → md + figures          │ │
+              │ │   AtomModelSingleton in-process      │ │
               │ ├──────────────────────────────────────┤ │
               │ │ corpus_core  (shared with radar)     │ │
-              │ │   Encoder · search · Reranker        │ │
+              │ │   Encoder.unload · search · Reranker │ │
               │ │   JobRegistry · mcp_scaffold         │ │
               │ ├──────────────────────────────────────┤ │
               │ │ lab_corpus_mcp                       │ │
               │ │   LabCorpusServer · LAB_TOOL_SPECS   │ │
-              │ │   loaders · upload · jobs (planned)  │ │
+              │ │   _release_gpu_vram (encoder+MinerU) │ │
               │ └──────────────────────────────────────┘ │
               └──────────────────────────────────────────┘
                        │                          ▲
@@ -156,6 +158,51 @@ The supervisor refuses to start if the two configs disagree on
 copy. Disable the encode-call lock with `--no-encoder-lock` if you
 have VRAM headroom and want concurrent encode throughput.
 
+## GPU memory release (v0.0.3, 2026-05-24)
+
+After every ingest job (`ingest_pdf` / `ingest_local_dir` /
+`ingest_url` / `ingest_arxiv_pdf`) and every `rebuild_index`, the
+server calls `LabCorpusServer._release_gpu_vram()` which:
+
+1. `Encoder.unload()` from corpus-core ≥ 0.2.0 — drops the shared
+   Qwen3-Embedding-4B (~7-8 GB bf16) + `torch.cuda.empty_cache()`.
+2. `unload_mineru_models()` — clears MinerU's `AtomModelSingleton` and
+   `HybridModelSingleton` model caches (~2-3 GB on pipeline backend)
+   + same CUDA cache flush.
+
+Net effect: between batches the lab-corpus container holds **near-zero
+GPU VRAM**, so the same RTX 4070 can run unrelated DFT / MLIP /
+training jobs on the host without OOM. First call after release pays
+the cold-load cost again (~20 sec encoder, ~30 sec MinerU pipeline),
+so this design optimises for **bursty ingest + occasional search**, not
+sustained low-latency queries.
+
+Concurrent jobs are safe: both unload functions are idempotent, and
+`Encoder.unload()` takes the same internal lock as `_ensure_loaded`,
+so a parallel encode either runs first or triggers a clean re-load on
+its next call.
+
+## MinerU library mode (s153, 2026-05-24)
+
+Earlier releases shelled out to `mineru` CLI for every ingest, which
+spawned a transient `LocalAPIServer` subprocess that loaded layout +
+OCR + table models (~30 sec cold-load), parsed one PDF, then died.
+Two PDFs in a row paid the cold-load twice; ten PDFs paid it ten
+times. The granchild process could also zombie under SIGKILL and pin
+VRAM.
+
+`lab_corpus_mcp.ingest._default_mineru_runner` now calls
+`mineru.cli.common.do_parse(...)` directly. MinerU's singleton model
+cache lives in the lab-corpus-mcp Python process across calls; a bulk
+`ingest_local_dir` of N PDFs loads models once for the whole batch.
+After the batch completes, `_release_gpu_vram` clears the singletons
+and frees VRAM (see above).
+
+The `MineruRunner` injection seam is preserved for tests — fakes that
+just write a stub markdown still plug in via the
+`runner=fake_mineru_runner` kwarg, so the test suite has no real
+MinerU dependency.
+
 ## Status
 
 - **Phase 1.5 done (2026-05-09)** in arxiv-radar-mcp — `corpus_core.mcp_scaffold`
@@ -199,7 +246,16 @@ have VRAM headroom and want concurrent encode throughput.
   `corpus_core.http_fetch.fetch_url` and feed them straight into
   the MinerU pipeline. Combined image shares one process-wide
   `Throttle` instance for arxiv.org so both backends respect the
-  ToS 1 req / 3 sec budget without coordinating. 143 tests green.
+  ToS 1 req / 3 sec budget without coordinating.
+- **s153 MinerU library mode + GPU unload (2026-05-24, v0.0.3):**
+  Ingest no longer shells out to the `mineru` CLI; calls
+  `mineru.cli.common.do_parse` directly so model loads are amortised
+  across a batch. After every ingest / reindex job,
+  `_release_gpu_vram()` drops both the Qwen3-Embedding-4B (via
+  `Encoder.unload()` from corpus-core 0.2.0) and MinerU's singleton
+  caches (via `unload_mineru_models()`), so the shared RTX 4070 on
+  gomer is free for unrelated compute between batches. 156 lab-corpus
+  tests + 119 corpus-core + 230 arxiv-radar = 505 green.
 - **Phase 2B+ (deferred):** PDF-content DOI extraction (currently filename
   arxiv-id or sha256 prefix), slide / video loaders.
 

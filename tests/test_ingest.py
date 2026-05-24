@@ -1,14 +1,16 @@
 """MinerU ingest-pipeline tests.
 
-The MinerU subprocess is replaced with a fake `MineruRunner` from
-`conftest.fake_mineru_runner`, so these tests cover the orchestration
-(figures copy, atomic markdown write, meta.json sidecar, error
-propagation) without needing the 2 GB MinerU install.
+The MinerU library call (`mineru.cli.common.do_parse`) is replaced with
+either a fake `MineruRunner` from `conftest.fake_mineru_runner` (for
+high-level tests) or a sys.modules injection of a stub `mineru.cli.common`
+(for `_default_mineru_runner` low-level tests). Both cover the
+orchestration logic without needing the 2 GB MinerU install.
 """
 from __future__ import annotations
 
 import json
-import subprocess
+import sys
+import types
 from pathlib import Path
 
 import pytest
@@ -23,7 +25,29 @@ from lab_corpus_mcp.ingest import (
     ingest_dir,
     ingest_one,
     run_mineru,
+    unload_mineru_models,
 )
+
+
+def _install_fake_mineru(monkeypatch, do_parse_impl):
+    """Inject a stand-in for `mineru.cli.common.do_parse` into sys.modules.
+
+    The real mineru package is a 2 GB install we don't want in the test
+    venv. `_default_mineru_runner` lazy-imports `do_parse` only on call,
+    so swapping the module entry before that import gives the runner
+    our fake without ever touching real MinerU.
+    """
+    # Build the parent chain so the relative import resolves cleanly.
+    pkg_mineru = types.ModuleType("mineru")
+    pkg_mineru_cli = types.ModuleType("mineru.cli")
+    mod_common = types.ModuleType("mineru.cli.common")
+    mod_common.do_parse = do_parse_impl
+    pkg_mineru.cli = pkg_mineru_cli
+    pkg_mineru_cli.common = mod_common
+
+    monkeypatch.setitem(sys.modules, "mineru", pkg_mineru)
+    monkeypatch.setitem(sys.modules, "mineru.cli", pkg_mineru_cli)
+    monkeypatch.setitem(sys.modules, "mineru.cli.common", mod_common)
 
 
 def test_ingest_one_writes_markdown_and_meta(tmp_path, fake_pdf, fake_mineru_runner):
@@ -195,25 +219,24 @@ def test_run_mineru_uses_injected_runner(tmp_path):
     assert captured["args"][2] == 42
 
 
-def test_default_runner_raises_when_subprocess_fails(monkeypatch, tmp_path):
+def test_default_runner_raises_when_library_call_fails(monkeypatch, tmp_path):
+    """`do_parse` raising must surface as IngestError so the JobRegistry
+    records a clean `failed` state instead of a crash."""
     src = tmp_path / "x.pdf"
     src.write_bytes(b"%PDF-1.4")
 
-    class _Fake:
-        returncode = 7
-        stderr = "boom"
-        stdout = ""
+    def _boom(**kwargs):
+        raise RuntimeError("simulated mineru failure")
 
-    monkeypatch.setattr("lab_corpus_mcp.ingest.subprocess.run",
-                        lambda *a, **kw: _Fake())
+    _install_fake_mineru(monkeypatch, _boom)
 
-    with pytest.raises(IngestError, match="rc=7"):
+    with pytest.raises(IngestError, match="mineru library call failed"):
         _default_mineru_runner(src, tmp_path / "out", timeout=10)
 
 
 def test_default_runner_canonical_layout(monkeypatch, tmp_path):
-    """When MinerU writes to `<out>/<stem>/auto/<stem>.md` (canonical 2.x
-    path), the runner returns it directly — no rglob fallback needed."""
+    """When MinerU writes to `<out>/<stem>/<parse_method>/<stem>.md` (canonical
+    library output), the runner returns it directly — no rglob fallback."""
     src = tmp_path / "x.pdf"
     src.write_bytes(b"%PDF-1.4")
     out_dir = tmp_path / "out"
@@ -221,13 +244,11 @@ def test_default_runner_canonical_layout(monkeypatch, tmp_path):
     canonical.parent.mkdir(parents=True)
     canonical.write_text("# h\n", encoding="utf-8")
 
-    class _Ok:
-        returncode = 0
-        stdout = ""
-        stderr = ""
+    def _stub_do_parse(**kwargs):
+        # Real do_parse already wrote the markdown — emulate by being a no-op.
+        return None
 
-    monkeypatch.setattr("lab_corpus_mcp.ingest.subprocess.run",
-                        lambda *a, **kw: _Ok())
+    _install_fake_mineru(monkeypatch, _stub_do_parse)
 
     md = _default_mineru_runner(src, out_dir, timeout=10)
     assert md == canonical
@@ -243,13 +264,10 @@ def test_default_runner_recovers_with_fallback_md(monkeypatch, tmp_path):
     fallback = out_dir / "weird-layout" / "produced.md"
     fallback.write_text("# h\n", encoding="utf-8")
 
-    class _Ok:
-        returncode = 0
-        stdout = ""
-        stderr = ""
+    def _stub_do_parse(**kwargs):
+        return None
 
-    monkeypatch.setattr("lab_corpus_mcp.ingest.subprocess.run",
-                        lambda *a, **kw: _Ok())
+    _install_fake_mineru(monkeypatch, _stub_do_parse)
 
     md = _default_mineru_runner(src, out_dir, timeout=10)
     assert md == fallback
@@ -261,16 +279,121 @@ def test_default_runner_raises_when_no_markdown(monkeypatch, tmp_path):
     out_dir = tmp_path / "out"
     out_dir.mkdir()
 
-    class _Ok:
-        returncode = 0
-        stdout = ""
-        stderr = ""
+    def _stub_do_parse(**kwargs):
+        return None  # produces no markdown anywhere under out_dir.
 
-    monkeypatch.setattr("lab_corpus_mcp.ingest.subprocess.run",
-                        lambda *a, **kw: _Ok())
+    _install_fake_mineru(monkeypatch, _stub_do_parse)
 
     with pytest.raises(IngestError, match="no markdown"):
         _default_mineru_runner(src, out_dir, timeout=10)
+
+
+def test_default_runner_passes_pdf_bytes_to_do_parse(monkeypatch, tmp_path):
+    """Confirm the library call gets the file's bytes (not its path) — this is
+    the contract `mineru.cli.common.do_parse` expects."""
+    src = tmp_path / "x.pdf"
+    src.write_bytes(b"%PDF-1.4 minimal payload")
+    out_dir = tmp_path / "out"
+    # Pre-create the canonical output so the runner can return cleanly.
+    canonical = out_dir / "x" / "auto" / "x.md"
+    canonical.parent.mkdir(parents=True)
+    canonical.write_text("# h\n", encoding="utf-8")
+
+    captured: dict = {}
+
+    def _stub_do_parse(**kwargs):
+        captured.update(kwargs)
+        return None
+
+    _install_fake_mineru(monkeypatch, _stub_do_parse)
+    _default_mineru_runner(src, out_dir, timeout=10, backend="pipeline")
+
+    assert captured["pdf_file_names"] == ["x"]
+    assert captured["pdf_bytes_list"] == [b"%PDF-1.4 minimal payload"]
+    assert captured["p_lang_list"] == ["ch"]
+    assert captured["backend"] == "pipeline"
+    assert captured["parse_method"] == "auto"
+
+
+# ----- unload_mineru_models -------------------------------------------------
+
+def test_unload_mineru_models_returns_false_when_mineru_absent(monkeypatch):
+    """On a host without MinerU installed (laptop / unit tests), the helper
+    must return False instead of raising ImportError."""
+    # Sabotage the import by removing any cached module + blocking the parent.
+    for name in ("mineru.backend.pipeline.model_init",
+                 "mineru.backend.pipeline",
+                 "mineru.backend",
+                 "mineru"):
+        monkeypatch.delitem(sys.modules, name, raising=False)
+
+    # Inject a finder that raises ImportError for the mineru.* path.
+    class _BlockMineru:
+        def find_module(self, name, path=None):
+            return self if name.startswith("mineru") else None
+
+        def find_spec(self, name, path=None, target=None):
+            if name.startswith("mineru"):
+                raise ImportError(f"blocked for test: {name}")
+            return None
+
+    monkeypatch.setattr("sys.meta_path", [_BlockMineru()] + sys.meta_path)
+    assert unload_mineru_models() is False
+
+
+def test_unload_mineru_models_clears_singleton_dicts(monkeypatch):
+    """When MinerU's singletons hold model instances, unload clears them
+    and reports True."""
+    # Build minimal fake singleton classes with a `_models` dict each.
+    class _FakeAtom:
+        _models = {"layout-en": object(), "ocr-ch": object()}
+
+    class _FakeHybrid:
+        _models = {"hybrid-en": object()}
+
+    # Inject fake `mineru.backend.pipeline.model_init` so the lazy import
+    # inside unload_mineru_models picks them up.
+    pkg_mineru = types.ModuleType("mineru")
+    pkg_backend = types.ModuleType("mineru.backend")
+    pkg_pipeline = types.ModuleType("mineru.backend.pipeline")
+    mod_init = types.ModuleType("mineru.backend.pipeline.model_init")
+    mod_init.AtomModelSingleton = _FakeAtom
+    mod_init.HybridModelSingleton = _FakeHybrid
+
+    monkeypatch.setitem(sys.modules, "mineru", pkg_mineru)
+    monkeypatch.setitem(sys.modules, "mineru.backend", pkg_backend)
+    monkeypatch.setitem(sys.modules, "mineru.backend.pipeline", pkg_pipeline)
+    monkeypatch.setitem(sys.modules, "mineru.backend.pipeline.model_init", mod_init)
+
+    assert _FakeAtom._models and _FakeHybrid._models
+    released = unload_mineru_models()
+    assert released is True
+    assert _FakeAtom._models == {}
+    assert _FakeHybrid._models == {}
+
+
+def test_unload_mineru_models_idempotent_when_already_empty(monkeypatch):
+    """When the singletons hold no models, unload returns False — the cuda
+    cache clear path is skipped to avoid touching the GPU for nothing."""
+    class _FakeAtom:
+        _models = {}
+
+    class _FakeHybrid:
+        _models = {}
+
+    pkg_mineru = types.ModuleType("mineru")
+    pkg_backend = types.ModuleType("mineru.backend")
+    pkg_pipeline = types.ModuleType("mineru.backend.pipeline")
+    mod_init = types.ModuleType("mineru.backend.pipeline.model_init")
+    mod_init.AtomModelSingleton = _FakeAtom
+    mod_init.HybridModelSingleton = _FakeHybrid
+
+    monkeypatch.setitem(sys.modules, "mineru", pkg_mineru)
+    monkeypatch.setitem(sys.modules, "mineru.backend", pkg_backend)
+    monkeypatch.setitem(sys.modules, "mineru.backend.pipeline", pkg_pipeline)
+    monkeypatch.setitem(sys.modules, "mineru.backend.pipeline.model_init", mod_init)
+
+    assert unload_mineru_models() is False
 
 
 def test_copy_figures_no_source(tmp_path):

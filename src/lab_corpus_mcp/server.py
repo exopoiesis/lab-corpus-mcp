@@ -68,6 +68,7 @@ from lab_corpus_mcp.ingest import (
     fetch_and_ingest,
     ingest_dir,
     ingest_one,
+    unload_mineru_models,
 )
 
 LOG = logging.getLogger(__name__)
@@ -375,6 +376,37 @@ class LabCorpusServer:
 
     # ----- job workers (called by JobRegistry on a worker thread) ----------
 
+    def _release_gpu_vram(self) -> None:
+        """Drop the bi-encoder AND MinerU models from VRAM after a job.
+
+        Lab-corpus runs on a single 12 GB RTX 4070 that's also used for
+        unrelated compute on the host (DFT/MLIP runs). Two big resident
+        consumers pin VRAM unless explicitly released:
+
+          * Qwen3-Embedding-4B (~7-8 GB bf16) — loaded on first query
+            or by `rebuild_index`. Encoder.unload() returns ownership.
+          * MinerU pipeline singletons (~2-3 GB) — loaded on first
+            ingest call when running in library mode (s153). Cleared
+            via `unload_mineru_models()` (clears AtomModelSingleton +
+            HybridModelSingleton dicts + cuda empty_cache).
+
+        Both unloads are idempotent: this is safe to call from every
+        job-completion path even when only one of the two was loaded.
+        First call after unload pays the cold-load cost again
+        (~20 sec encoder, ~30 sec MinerU pipeline).
+        """
+        try:
+            self.encoder.unload()
+        except Exception as e:  # noqa: BLE001
+            LOG.warning(f"encoder.unload() failed (will keep model resident): {e}")
+        try:
+            unload_mineru_models()
+        except Exception as e:  # noqa: BLE001
+            LOG.warning(f"unload_mineru_models() failed: {e}")
+
+    # Back-compat alias for tests / external callers written before s153.
+    _release_encoder_vram = _release_gpu_vram
+
     def _do_ingest_one(self, handle: JobHandle, input_file: Path,
                        paper_id: str | None, backend: str) -> dict:
         try:
@@ -383,6 +415,8 @@ class LabCorpusServer:
                                runner=self.mineru_runner)
         except IngestError as e:
             raise JobError(str(e)) from e
+        finally:
+            self._release_gpu_vram()
         # Refresh in-memory papers so corpus_stats / list_corpus see the new file.
         self.papers[paper.paper_id] = paper
         handle.update(n_done=1)
@@ -401,6 +435,8 @@ class LabCorpusServer:
             )
         except IngestError as e:
             raise JobError(str(e)) from e
+        finally:
+            self._release_gpu_vram()
         # Reload papers map — bulk ingest may have added many.
         self.papers = load_lab_papers(self.parse_dir)
         return result
@@ -414,6 +450,8 @@ class LabCorpusServer:
             )
         except IngestError as e:
             raise JobError(str(e)) from e
+        finally:
+            self._release_gpu_vram()
         self.papers[paper.paper_id] = paper
         handle.update(n_done=1)
         return {
@@ -437,6 +475,12 @@ class LabCorpusServer:
             raise JobError(str(e)) from e
         finally:
             self.jobs.release_reindex_lock()
+            # Release Qwen3-4B from VRAM once chunks are written and the
+            # index is back on disk. The next search call will re-load
+            # (≈20 sec cold). Without this, the encoder pins ~7-8 GB
+            # for the server lifetime, blocking unrelated GPU work on
+            # the same host.
+            self._release_gpu_vram()
 
         self.fulltext_index = new_index
         # Sync per-paper n_chunks back into LabPaper metadata.

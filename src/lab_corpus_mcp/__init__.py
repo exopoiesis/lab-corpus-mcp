@@ -20,4 +20,4 @@ Planned (Phase 2B+):
 `--transport http` for the long-running backend, or `--remote` for the
 local stdio→remote-HTTP proxy.
 """
-__version__ = "0.0.2"
+__version__ = "0.0.3"

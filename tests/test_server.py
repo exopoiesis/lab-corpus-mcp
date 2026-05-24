@@ -864,6 +864,122 @@ def test_ingest_local_dir_runner_failure_marks_job_failed(lab_config, tmp_path):
         srv.jobs.shutdown()
 
 
+# ----- VRAM release after heavy jobs -----------------------------------------
+
+def test_release_gpu_vram_calls_encoder_and_mineru_unload(lab_config, monkeypatch):
+    """The helper proxies to encoder.unload() AND unload_mineru_models()."""
+    srv = LabCorpusServer(lab_config)
+    try:
+        calls = {"encoder": 0, "mineru": 0}
+
+        def _fake_encoder_unload():
+            calls["encoder"] += 1
+            return True
+
+        def _fake_mineru_unload():
+            calls["mineru"] += 1
+            return True
+
+        srv.encoder.unload = _fake_encoder_unload  # type: ignore[method-assign]
+        monkeypatch.setattr("lab_corpus_mcp.server.unload_mineru_models",
+                            _fake_mineru_unload)
+        srv._release_gpu_vram()
+        assert calls == {"encoder": 1, "mineru": 1}
+    finally:
+        srv.jobs.shutdown()
+
+
+def test_release_gpu_vram_swallows_encoder_exceptions(lab_config, caplog):
+    srv = LabCorpusServer(lab_config)
+    try:
+        def _boom():
+            raise RuntimeError("simulated cuda issue")
+        srv.encoder.unload = _boom  # type: ignore[method-assign]
+        with caplog.at_level("WARNING"):
+            srv._release_gpu_vram()  # must not raise
+        assert any("encoder.unload() failed" in rec.message
+                   for rec in caplog.records)
+    finally:
+        srv.jobs.shutdown()
+
+
+def test_release_gpu_vram_swallows_mineru_exceptions(lab_config, caplog, monkeypatch):
+    srv = LabCorpusServer(lab_config)
+    try:
+        def _boom():
+            raise RuntimeError("simulated mineru issue")
+        monkeypatch.setattr("lab_corpus_mcp.server.unload_mineru_models", _boom)
+        with caplog.at_level("WARNING"):
+            srv._release_gpu_vram()  # must not raise
+        assert any("unload_mineru_models() failed" in rec.message
+                   for rec in caplog.records)
+    finally:
+        srv.jobs.shutdown()
+
+
+def test_release_encoder_vram_alias_still_works(lab_config):
+    """Back-compat alias for code/tests written before s153 rename."""
+    srv = LabCorpusServer(lab_config)
+    try:
+        # The alias must be a real attribute, not a typo.
+        assert srv._release_encoder_vram is not None
+        # And calling it should not raise.
+        srv._release_encoder_vram()
+    finally:
+        srv.jobs.shutdown()
+
+
+def test_rebuild_index_unloads_encoder_on_success(monkeypatch, lab_config,
+                                                   populated_parse_dir):
+    """Successful reindex must release VRAM before returning."""
+    fake_index = _FakeIndex(n_chunks=2, n_papers=1,
+                            model_name=lab_config.embeddings.model)
+    monkeypatch.setattr("lab_corpus_mcp.server.reindex",
+                        lambda *a, **kw: fake_index)
+
+    srv = LabCorpusServer(lab_config)
+    try:
+        calls = {"n": 0}
+        srv.encoder.unload = lambda: (calls.__setitem__("n", calls["n"] + 1) or True)  # type: ignore[method-assign]
+        result = srv.rebuild_index()
+        _wait_for_terminal(srv, result["job_id"])
+        assert calls["n"] == 1
+    finally:
+        srv.jobs.shutdown()
+
+
+def test_rebuild_index_unloads_encoder_on_failure(monkeypatch, lab_config,
+                                                   populated_parse_dir):
+    """Even when reindex blows up, the finally block must release VRAM."""
+    def _missing(*a, **kw):
+        raise FileNotFoundError("phantom cache")
+    monkeypatch.setattr("lab_corpus_mcp.server.reindex", _missing)
+
+    srv = LabCorpusServer(lab_config)
+    try:
+        calls = {"n": 0}
+        srv.encoder.unload = lambda: (calls.__setitem__("n", calls["n"] + 1) or True)  # type: ignore[method-assign]
+        result = srv.rebuild_index()
+        _wait_for_terminal(srv, result["job_id"])
+        assert calls["n"] == 1
+    finally:
+        srv.jobs.shutdown()
+
+
+def test_ingest_pdf_unloads_encoder_after_job(lab_config, fake_pdf,
+                                               fake_mineru_runner):
+    """ingest_pdf success path must hit _release_encoder_vram."""
+    srv = LabCorpusServer(lab_config, mineru_runner=fake_mineru_runner)
+    try:
+        calls = {"n": 0}
+        srv.encoder.unload = lambda: (calls.__setitem__("n", calls["n"] + 1) or True)  # type: ignore[method-assign]
+        result = srv.ingest_pdf(str(fake_pdf))
+        _wait_for_terminal(srv, result["job_id"])
+        assert calls["n"] == 1
+    finally:
+        srv.jobs.shutdown()
+
+
 def test_rebuild_index_filenotfound_becomes_joberror(monkeypatch, lab_config,
                                                      populated_parse_dir):
     """corpus_core.corpus_index.reindex raising FileNotFoundError must be

@@ -1,6 +1,6 @@
 [project]
 name = "lab-corpus-mcp"
-version = "0.0.1"
+version = "0.0.3"
 description = "Personal research-OS layer on top of arxiv-radar-mcp: literature PDFs, slides, admin tools."
 readme = "README.md"
 requires-python = ">=3.10,<3.14"
@@ -35,7 +35,7 @@ classifiers = [
 #
 # The Docker image (Dockerfile) does the same thing inside the container.
 dependencies = [
-    "corpus-core>=0.1.0",
+    "corpus-core>=0.2.0",
     "arxiv-radar-mcp>=0.0.1",
     "mcp>=1.0",
     "numpy>=1.26",
