@@ -45,6 +45,11 @@ class EmbeddingsConfig:
     cache_dir: Path = field(default_factory=lambda: _default_cache_dir() / "embeddings")
     batch_size: int = 32
     target_dim: int | None = None
+    # Drop the bi-encoder from VRAM after this many seconds with no encode
+    # activity (search query / reindex). Explicit unload() only fires on job
+    # completion, so without this a single search would pin ~7-8 GB for the
+    # server's lifetime. 0 disables (model stays resident once warmed).
+    idle_unload_s: int = 600
 
 
 @dataclass
@@ -112,6 +117,7 @@ def _from_dict(data: dict) -> Config:
         cache_dir=Path(cache_dir).expanduser() if cache_dir else _default_cache_dir() / "embeddings",
         batch_size=int(embeddings_raw.get("batch_size", 32)),
         target_dim=embeddings_raw.get("target_dim"),
+        idle_unload_s=int(embeddings_raw.get("idle_unload_s", 600)),
     )
 
     parse_raw = data.get("parse", {})
