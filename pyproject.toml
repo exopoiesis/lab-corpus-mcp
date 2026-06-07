@@ -35,7 +35,7 @@ classifiers = [
 #
 # The Docker image (Dockerfile) does the same thing inside the container.
 dependencies = [
-    "corpus-core>=0.1.1",
+    "corpus-core>=0.1.0",
     "arxiv-radar-mcp>=0.0.1",
     "python-multipart>=0.0.9",
     "mcp>=1.0",

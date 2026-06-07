@@ -57,7 +57,6 @@ from corpus_core.mcp_scaffold import (
     build_mcp_app,
     make_method_dispatcher,
     serve_stdio,
-    serve_streamable_http,
 )
 
 from lab_corpus_mcp.config import Config, load
@@ -976,17 +975,49 @@ async def _run_stdio(server: LabCorpusServer) -> None:
 
 
 async def _run_streamable_http(server: LabCorpusServer, host: str, port: int) -> None:
-    from starlette.routing import Route  # noqa: PLC0415
-    upload_route = Route("/upload", endpoint=_make_upload_handler(server), methods=["POST"])
-    await serve_streamable_http(
+    """Streamable-HTTP MCP loop with lab-specific /upload sidecar.
+
+    Builds the Starlette app directly (not via corpus_core.serve_streamable_http)
+    so we can mount /upload alongside /mcp on the same port without
+    pushing lab-specific routing concerns into corpus-core.
+    """
+    import uvicorn                                                     # noqa: PLC0415
+    from mcp.server.streamable_http_manager import (                  # noqa: PLC0415
+        StreamableHTTPSessionManager,
+    )
+    from starlette.applications import Starlette                       # noqa: PLC0415
+    from starlette.routing import Mount, Route                         # noqa: PLC0415
+
+    from corpus_core.mcp_scaffold import build_mcp_app                # noqa: PLC0415
+
+    mcp_app = build_mcp_app(
         server_name="lab-corpus",
         tool_specs=LAB_TOOL_SPECS,
         dispatcher=make_method_dispatcher(server, _tool_names()),
-        host=host,
-        port=port,
-        background_tasks=_lab_background_tasks(server),
-        extra_routes=[upload_route],
     )
+    session_manager = StreamableHTTPSessionManager(
+        app=mcp_app, json_response=True, stateless=False,
+    )
+
+    async def _handle_mcp(scope, receive, send):
+        await session_manager.handle_request(scope, receive, send)
+
+    starlette_app = Starlette(routes=[
+        Mount("/mcp", app=_handle_mcp),
+        Route("/upload", endpoint=_make_upload_handler(server), methods=["POST"]),
+    ])
+
+    bg = [asyncio.create_task(make()) for make in _lab_background_tasks(server)]
+    try:
+        async with session_manager.run():
+            uv_config = uvicorn.Config(
+                starlette_app, host=host, port=port,
+                log_level="info", access_log=False,
+            )
+            await uvicorn.Server(uv_config).serve()
+    finally:
+        for t in bg:
+            t.cancel()
 
 
 def serve(config_path: Path | None = None) -> None:
