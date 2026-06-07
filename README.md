@@ -73,27 +73,40 @@ lab-corpus-mcp/
 │   ├── config.py               # LabConfig: embeddings + parse + server
 │   ├── corpus.py               # LabPaper schema + paper_id derivation + on-disk loader
 │   ├── ingest.py               # MinerU wrapper: ingest_one / ingest_dir / fetch_and_ingest (U14)
-│   └── server.py               # LabCorpusServer + LAB_TOOL_SPECS + serve/serve_http
+│   ├── server.py               # LabCorpusServer + LAB_TOOL_SPECS + serve/serve_http + /upload
+│   └── upload_inbox.py         # `lab-corpus-upload` CLI — batch upload to /upload endpoint
 ├── tests/                      # pytest suite, 99% coverage on lab_corpus_mcp
 └── tmp/                        # local-iteration helpers (gitignored)
 ```
 
-## Tool surface (Phase 2B + U14, 13 tools)
+## Tool surface (14 tools)
 
-| Tool | Phase | Notes |
-|------|-------|-------|
-| `corpus_stats` | 2A | parsed / indexed / chunks + last ingest |
-| `list_corpus` | 2A | paper rows newest-ingest-first, `limit` arg |
-| `paper_info` | 2B | full LabPaper + indexed status |
-| `job_status` / `job_list` | 2A | delegate to `corpus_core.JobRegistry` |
-| `ingest_pdf` | 2B-1 | async; MinerU on one file (PDF/DOCX/PPTX/image) |
-| `ingest_local_dir` | 2B-1 | async; bulk ingest by glob, optional recursion |
-| `ingest_url` | 2B+ (U14) | async; download via `corpus_core.fetch_url` → MinerU. Any http(s) URL. |
-| `ingest_arxiv_pdf` | 2B+ (U14) | async; convenience for arxiv preprints — forces `paper_id = arxiv_id` |
-| `rebuild_index` | 2B-2 | async; delegates to `corpus_core.corpus_index.reindex` |
-| `search_paper_text` | 2B-2 | substring AND-scan over chunks |
-| `search_paper_semantic` | 2B-2 | cosine over chunk embeddings (Qwen3-4B-native default) |
-| `similar_to_paper` | 2B-2 | nearest-neighbour by mean-of-chunks |
+| Tool | Notes |
+|------|-------|
+| `corpus_stats` | parsed / indexed / chunks + last ingest timestamp |
+| `list_corpus` | paper rows newest-ingest-first, optional `limit` |
+| `paper_info` | full LabPaper metadata + indexed status |
+| `job_status` / `job_list` | background job tracking via `corpus_core.JobRegistry` |
+| `ingest_pdf` | async; MinerU on one file already on the server (PDF/DOCX/PPTX/image) |
+| `ingest_local_dir` | async; bulk ingest of a server-side directory by glob |
+| `ingest_inbox` | async; bulk ingest of `<parse.dir>/inbox/` — use after `lab-corpus-upload` or `docker cp` |
+| `ingest_url` | async; download any http(s) URL → MinerU (no upload needed) |
+| `ingest_arxiv_pdf` | async; convenience for arxiv preprints — forces `paper_id = arxiv_id` |
+| `rebuild_index` | async; re-encode all parsed markdowns with Qwen3-4B |
+| `search_paper_text` | substring AND-scan over chunks |
+| `search_paper_semantic` | cosine over chunk embeddings (Qwen3-4B-native default) |
+| `similar_to_paper` | nearest-neighbour by chunk-mean cosine |
+
+### Choosing the right ingest tool
+
+| Situation | Tool |
+|-----------|------|
+| Files on your local machine | `lab-corpus-upload` CLI → `ingest_inbox` |
+| Files dropped via `docker cp` / `scp` | `ingest_inbox` |
+| arxiv preprint (any arxiv ID) | `ingest_arxiv_pdf` |
+| Any web URL (journal, OSF, preprint server) | `ingest_url` |
+| Single file already on the server | `ingest_pdf` |
+| Arbitrary server-side directory | `ingest_local_dir` |
 
 `paper_id` ∈ {DOI, sha256-of-file, arxiv_id-from-filename, user-supplied},
 distinguished by `paper_id_kind` in the `LabPaper` metadata sidecar.
@@ -126,6 +139,60 @@ Downloads land under `<parse.dir>/inbox/<filename>` via
 so the combined image shares one 1 req / 3 sec budget between
 arxiv-radar's HTML/LaTeX fetcher and lab-corpus's PDF downloader —
 no double-spam. Closes arxiv-radar-mcp's U14.
+
+### Batch upload from a remote client
+
+When lab-corpus-mcp runs on a remote host (Docker on gomer), local PDF
+files need to get there before MinerU can parse them. The MCP protocol
+is JSON-RPC — no native binary transport — so upload happens over a
+separate `POST /upload` HTTP endpoint on the same port as `/mcp`.
+
+**`lab-corpus-upload` CLI** (installed with the package):
+
+```bash
+# Upload a folder of PDFs and start ingest in one shot:
+lab-corpus-upload ~/papers/ http://localhost:8766
+
+# Upload only, trigger ingest manually later:
+lab-corpus-upload ~/papers/ http://localhost:8766 --no-ingest
+
+# Non-PDF files:
+lab-corpus-upload ~/slides/ http://localhost:8766 --glob "*.pptx"
+
+# Single file:
+lab-corpus-upload paper.pdf http://localhost:8766
+```
+
+The script uploads files one by one to `POST /upload`, which writes
+them atomically to `<parse.dir>/inbox/`. On the last file it appends
+`?ingest=true`, triggering `ingest_inbox()` server-side and returning
+a `job_id`. Track progress with `job_status` in Claude.
+
+**SSH tunnel** (if the server is bound to `127.0.0.1`):
+
+```bash
+# One-time tunnel setup — run on your local machine:
+ssh -L 8766:localhost:18766 gomer -N &
+
+# Then upload normally:
+lab-corpus-upload ~/papers/ http://localhost:8766
+```
+
+**`POST /upload` endpoint** (HTTP mode only, not available in stdio):
+
+```
+POST http://<host>:<port>/upload
+Content-Type: multipart/form-data
+
+field name: "file"  (repeat for multiple files)
+query:  ?ingest=true   — also trigger ingest_inbox() after saving
+```
+
+Response: `{"saved": [...], "n_saved": N, "errors": [...], "inbox": "...", "job_id": "..." | null}`
+
+**`ingest_inbox` MCP tool** — zero-arg shortcut to ingest everything in
+`<parse.dir>/inbox/`. Call this after any manual `docker cp` / `scp`
+drop, or let `lab-corpus-upload` trigger it automatically.
 
 ## Combined mode — both backends on one Qwen
 

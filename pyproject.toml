@@ -60,6 +60,7 @@ dev = [
 
 [project.scripts]
 lab-corpus-mcp = "lab_corpus_mcp.__main__:main"
+lab-corpus-upload = "lab_corpus_mcp.upload_inbox:main"
 
 [project.urls]
 Homepage = "https://github.com/exopoiesis/lab-corpus-mcp"
