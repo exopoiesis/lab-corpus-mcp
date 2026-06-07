@@ -901,7 +901,7 @@ def _make_upload_handler(server: "LabCorpusServer"):
             try:
                 content = await field.read()
                 tmp.write_bytes(content)
-                os.replace(tmp, dest)
+                tmp.replace(dest)
                 saved.append(safe_name)
                 LOG.info(f"upload: saved {safe_name} ({len(content):,} bytes)")
             except Exception as e:  # noqa: BLE001

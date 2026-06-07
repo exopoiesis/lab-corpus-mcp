@@ -108,6 +108,9 @@ class _StubLab:
         return {"called": "ingest_local_dir", "dir": dir_path, "glob": glob,
                 "recursive": recursive}
 
+    def ingest_inbox(self, glob="*.pdf", recursive=False, backend=None):
+        return {"called": "ingest_inbox", "glob": glob, "recursive": recursive}
+
     def ingest_url(self, url, paper_id=None, backend=None):
         return {"called": "ingest_url", "url": url,
                 "paper_id": paper_id, "backend": backend}
@@ -425,6 +428,79 @@ def test_ingest_local_dir_bulk(lab_config, tmp_path, fake_mineru_runner):
         assert info["result"]["n_failed"] == 0
         # Three new papers picked up by the in-memory map.
         assert len(srv.papers) == 3
+    finally:
+        srv.jobs.shutdown()
+
+
+# ----- ingest_inbox -----------------------------------------------------------
+
+def test_ingest_inbox_dispatch_routes():
+    out = _dispatch(_StubLab(), "ingest_inbox", {})
+    assert out["called"] == "ingest_inbox"
+    assert out["glob"] == "*.pdf"
+
+
+def test_ingest_inbox_dispatch_with_args():
+    out = _dispatch(_StubLab(), "ingest_inbox",
+                    {"glob": "*.docx", "recursive": True})
+    assert out == {"called": "ingest_inbox", "glob": "*.docx", "recursive": True}
+
+
+def test_ingest_inbox_empty_inbox_returns_error(lab_config):
+    # inbox dir does not exist yet — should be created, then return an error
+    # because there are no files.
+    srv = LabCorpusServer(lab_config)
+    try:
+        out = srv.ingest_inbox()
+        assert "error" in out
+        assert "no files" in out["error"].lower() or "copy files" in out["error"].lower()
+        # Inbox dir was created as a side effect.
+        assert (lab_config.parse.dir / "inbox").is_dir()
+    finally:
+        srv.jobs.shutdown()
+
+
+def test_ingest_inbox_creates_inbox_dir_if_missing(lab_config):
+    srv = LabCorpusServer(lab_config)
+    try:
+        assert not (lab_config.parse.dir / "inbox").exists()
+        srv.ingest_inbox()  # empty — returns error, but dir should exist
+        assert (lab_config.parse.dir / "inbox").is_dir()
+    finally:
+        srv.jobs.shutdown()
+
+
+def test_ingest_inbox_submits_job_and_processes(lab_config, fake_mineru_runner):
+    inbox = lab_config.parse.dir / "inbox"
+    inbox.mkdir(parents=True, exist_ok=True)
+    for i in range(2):
+        (inbox / f"paper-{i:02d}.pdf").write_bytes(f"%PDF-1.4\n{i}".encode())
+
+    srv = LabCorpusServer(lab_config, mineru_runner=fake_mineru_runner)
+    try:
+        result = srv.ingest_inbox()
+        assert "job_id" in result, result
+        assert result["kind"] == "ingest_inbox"
+        assert result["n_total"] == 2
+        assert str(inbox) == result["inbox"]
+        info = _wait_for_terminal(srv, result["job_id"], timeout=4.0)
+        assert info["state"] == "done", info
+        assert info["result"]["n_ok"] == 2
+        assert info["result"]["n_failed"] == 0
+    finally:
+        srv.jobs.shutdown()
+
+
+def test_ingest_inbox_glob_filters_files(lab_config, fake_mineru_runner):
+    inbox = lab_config.parse.dir / "inbox"
+    inbox.mkdir(parents=True, exist_ok=True)
+    (inbox / "doc.pdf").write_bytes(b"%PDF-1.4")
+    (inbox / "slide.pptx").write_bytes(b"PK fake pptx")
+
+    srv = LabCorpusServer(lab_config, mineru_runner=fake_mineru_runner)
+    try:
+        result = srv.ingest_inbox(glob="*.pptx")
+        assert result["n_total"] == 1
     finally:
         srv.jobs.shutdown()
 
