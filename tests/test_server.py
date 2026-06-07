@@ -30,7 +30,7 @@ EXPECTED_TOOLS = {
     # Phase 2A skeleton + paper_info
     "corpus_stats", "list_corpus", "paper_info", "job_status", "job_list",
     # Phase 2B-1 ingest
-    "ingest_pdf", "ingest_local_dir",
+    "ingest_pdf", "ingest_local_dir", "ingest_inbox",
     # Phase 2B+ U14 fetch-by-URL
     "ingest_url", "ingest_arxiv_pdf",
     # Phase 2B-2 index + search
@@ -78,7 +78,7 @@ def test_no_arxiv_radar_tools_leak_through():
 
 def test_tool_names_helper_matches_specs():
     assert set(_tool_names()) == EXPECTED_TOOLS
-    assert len(_tool_names()) == len(LAB_TOOL_SPECS) == 13
+    assert len(_tool_names()) == len(LAB_TOOL_SPECS) == 14
 
 
 # ----- _dispatch -------------------------------------------------------------
@@ -1006,7 +1006,7 @@ def test_build_mcp_app_constructs_server(lab_config):
     try:
         app = _build_mcp_app(srv)
         assert app is not None
-        assert len(LAB_TOOL_SPECS) == 13
+        assert len(LAB_TOOL_SPECS) == 14
     finally:
         srv.jobs.shutdown()
 

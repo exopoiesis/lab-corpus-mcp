@@ -270,6 +270,11 @@ class LabCorpusServer:
                          backend: str | None = None) -> dict:
         """Submit a background bulk-ingest job. Returns {job_id, n_total}.
 
+        `dir_path` is an **absolute path on the server's filesystem**
+        (e.g. inside the Docker container). For the common case of
+        ingesting files you've copied to the inbox directory, use
+        `ingest_inbox` instead — it requires no path argument.
+
         `backend` is forwarded to each per-file MinerU run; see
         ingest_pdf for the trade-off.
         """
@@ -293,6 +298,56 @@ class LabCorpusServer:
         )
         return {"job_id": job_id, "kind": "ingest_local_dir",
                 "n_total": n_total, "backend": backend_eff}
+
+    def ingest_inbox(self, glob: str = "*.pdf",
+                     recursive: bool = False,
+                     backend: str | None = None) -> dict:
+        """Submit a bulk ingest of all files in <parse.dir>/inbox/.
+
+        Drop-box workflow for files on a remote host:
+          1. Copy files to the server's inbox:
+               docker cp paper.pdf lab-corpus:/srv/lab-corpus/inbox/
+               # or: scp paper.pdf gomer:/srv/lab-corpus/inbox/
+          2. Call ingest_inbox() — no path argument needed.
+
+        The inbox is the same directory used by `ingest_url` /
+        `ingest_arxiv_pdf` for server-side downloads, so any files
+        previously fetched there are also eligible.
+
+        `backend` is forwarded to each per-file MinerU run; see
+        ingest_pdf for the trade-off.
+        """
+        inbox = self.parse_dir / "inbox"
+        inbox.mkdir(parents=True, exist_ok=True)
+
+        iterator = inbox.rglob(glob) if recursive else inbox.glob(glob)
+        n_total = sum(1 for p in iterator if p.is_file())
+        if n_total == 0:
+            return {
+                "error": (
+                    f"no files matching {glob!r} in {inbox} — "
+                    "copy files there first "
+                    "(docker cp file.pdf lab-corpus:/srv/lab-corpus/inbox/ "
+                    "or scp)"
+                )
+            }
+
+        from lab_corpus_mcp.ingest import DEFAULT_BACKEND
+        backend_eff = backend or DEFAULT_BACKEND
+        job_id = self.jobs.submit(
+            kind="ingest_inbox",
+            fn=lambda h: self._do_ingest_dir(h, inbox, glob, recursive, backend_eff),
+            args={"inbox": str(inbox), "glob": glob, "recursive": recursive,
+                  "backend": backend_eff},
+            n_total=n_total,
+        )
+        return {
+            "job_id": job_id,
+            "kind": "ingest_inbox",
+            "inbox": str(inbox),
+            "n_total": n_total,
+            "backend": backend_eff,
+        }
 
     def ingest_url(self, url: str, paper_id: str | None = None,
                    backend: str | None = None) -> dict:
@@ -609,16 +664,21 @@ LAB_TOOL_SPECS: list[dict[str, Any]] = [
     {
         "name": "ingest_local_dir",
         "description": (
-            "Submit a bulk MinerU ingest of every matching file in a "
-            "directory. Returns {job_id, n_total} immediately. Glob defaults "
-            "to `*.pdf`; pass `*.docx` / `*.pptx` / `*` etc. for other types. "
-            "`recursive=true` walks subdirectories. `backend` is forwarded "
-            "to each per-file MinerU run; see ingest_pdf for the trade-off."
+            "Submit a bulk MinerU ingest of every matching file in an "
+            "arbitrary directory on the **server's** filesystem. "
+            "Returns {job_id, n_total} immediately. "
+            "Glob defaults to `*.pdf`; pass `*.docx` / `*.pptx` / `*` etc. "
+            "for other types. `recursive=true` walks subdirectories. "
+            "For the common remote-client workflow (copy PDFs via docker cp / "
+            "scp then ingest), prefer `ingest_inbox` — it needs no path argument."
         ),
         "inputSchema": {
             "type": "object",
             "properties": {
-                "dir_path": {"type": "string"},
+                "dir_path": {
+                    "type": "string",
+                    "description": "Absolute path on the server's filesystem.",
+                },
                 "glob": {"type": "string", "default": "*.pdf"},
                 "recursive": {"type": "boolean", "default": False},
                 "backend": {
@@ -628,6 +688,38 @@ LAB_TOOL_SPECS: list[dict[str, Any]] = [
                 },
             },
             "required": ["dir_path"],
+        },
+    },
+    {
+        "name": "ingest_inbox",
+        "description": (
+            "Submit a bulk ingest of all files in the server's drop-box "
+            "inbox (<parse.dir>/inbox/). Async — returns {job_id, n_total} "
+            "immediately; poll with job_status. "
+            "Workflow: copy PDFs to the container inbox first — "
+            "`docker cp paper.pdf lab-corpus:/srv/lab-corpus/inbox/` "
+            "or `scp paper.pdf gomer:/srv/lab-corpus/inbox/` — "
+            "then call this tool with no required args. "
+            "Glob defaults to `*.pdf`; pass `*.docx` / `*` for other types. "
+            "The inbox is also where `ingest_url` / `ingest_arxiv_pdf` "
+            "land their downloads, so any previously fetched files "
+            "sitting there are included."
+        ),
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "glob": {
+                    "type": "string",
+                    "default": "*.pdf",
+                    "description": "Filename glob (default: `*.pdf`).",
+                },
+                "recursive": {"type": "boolean", "default": False},
+                "backend": {
+                    "type": "string",
+                    "enum": ["pipeline", "vlm-transformers"],
+                    "description": "MinerU backend (default: pipeline).",
+                },
+            },
         },
     },
     # ----- fetch-by-URL (Phase 2B+, U14) -----------------------------------
@@ -766,6 +858,75 @@ def _tool_names() -> list[str]:
     return [spec["name"] for spec in LAB_TOOL_SPECS]
 
 
+def _make_upload_handler(server: "LabCorpusServer"):
+    """Starlette async endpoint: POST /upload (multipart) → <parse.dir>/inbox/.
+
+    Accepts one or more files per request. Filename is taken from the
+    Content-Disposition header and sanitised (basename only, no traversal).
+
+    Query params:
+      ?ingest=true  — after saving files, submit an ingest_inbox() background
+                      job. Returns the job_id in the response. Useful for
+                      one-shot upload+ingest from the companion CLI script.
+
+    Response JSON: {saved, n_saved, errors, inbox, job_id}
+
+    Requires ``python-multipart`` to be installed (Starlette's multipart
+    parser). Already declared in pyproject.toml dependencies.
+    """
+    async def upload(request):
+        from starlette.datastructures import UploadFile   # noqa: PLC0415
+        from starlette.responses import JSONResponse       # noqa: PLC0415
+
+        inbox = server.parse_dir / "inbox"
+        inbox.mkdir(parents=True, exist_ok=True)
+
+        try:
+            form = await request.form()
+        except Exception as e:  # noqa: BLE001
+            from starlette.responses import JSONResponse as _JR  # noqa: PLC0415
+            return _JR({"error": f"multipart parse failed: {e}"}, status_code=400)
+
+        saved: list[str] = []
+        errors: list[dict] = []
+        for _key, field in form.multi_items():
+            if not isinstance(field, UploadFile):
+                continue
+            raw_name = field.filename or ""
+            safe_name = Path(raw_name).name  # strip any path prefix
+            if not safe_name or safe_name in (".", ".."):
+                errors.append({"filename": raw_name, "error": "invalid filename"})
+                continue
+            dest = inbox / safe_name
+            tmp = dest.with_suffix(dest.suffix + ".tmp")
+            try:
+                content = await field.read()
+                tmp.write_bytes(content)
+                os.replace(tmp, dest)
+                saved.append(safe_name)
+                LOG.info(f"upload: saved {safe_name} ({len(content):,} bytes)")
+            except Exception as e:  # noqa: BLE001
+                errors.append({"filename": safe_name, "error": str(e)})
+            finally:
+                await field.close()
+
+        job_id = None
+        if saved and request.query_params.get("ingest") in ("1", "true", "yes"):
+            result = server.ingest_inbox()
+            job_id = result.get("job_id")
+
+        status = 200 if saved else (400 if errors else 422)
+        return JSONResponse({
+            "saved": saved,
+            "n_saved": len(saved),
+            "errors": errors,
+            "inbox": str(inbox),
+            "job_id": job_id,
+        }, status_code=status)
+
+    return upload
+
+
 def _dispatch(server: LabCorpusServer, name: str, arguments: dict[str, Any] | None) -> Any:
     """Route an MCP tool-call to the matching LabCorpusServer method.
 
@@ -815,6 +976,8 @@ async def _run_stdio(server: LabCorpusServer) -> None:
 
 
 async def _run_streamable_http(server: LabCorpusServer, host: str, port: int) -> None:
+    from starlette.routing import Route  # noqa: PLC0415
+    upload_route = Route("/upload", endpoint=_make_upload_handler(server), methods=["POST"])
     await serve_streamable_http(
         server_name="lab-corpus",
         tool_specs=LAB_TOOL_SPECS,
@@ -822,6 +985,7 @@ async def _run_streamable_http(server: LabCorpusServer, host: str, port: int) ->
         host=host,
         port=port,
         background_tasks=_lab_background_tasks(server),
+        extra_routes=[upload_route],
     )
 
 
