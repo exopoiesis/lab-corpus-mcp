@@ -21,7 +21,7 @@ classifiers = [
 
 # Three siblings share a Docker image / dev tree:
 #   * corpus-core      — Encoder, EmbeddingIndex, search primitives,
-#                        chunker, JobRegistry, MCP scaffold.
+#                        chunker, JobRegistry, MCP scaffold. On PyPI since 0.1.0.
 #   * arxiv-radar-mcp  — RadarServer, arxiv shards, daily refresh.
 #                        Lab depends on it for `combined` mode (one
 #                        Qwen for both backends).
@@ -29,13 +29,13 @@ classifiers = [
 #
 # For pip-only local installs (no docker), siblings must be path-installed
 # in dependency order:
-#   pip install -e ../corpus-core
+#   pip install -e ../corpus-core   (or: pip install corpus-core)
 #   pip install -e ../arxiv-radar-mcp
 #   pip install -e .
 #
 # The Docker image (Dockerfile) does the same thing inside the container.
 dependencies = [
-    "corpus-core>=0.2.0",
+    "corpus-core>=0.1.0",
     "arxiv-radar-mcp>=0.0.1",
     "mcp>=1.0",
     "numpy>=1.26",
