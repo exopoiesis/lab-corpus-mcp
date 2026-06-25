@@ -792,7 +792,6 @@ def test_search_paper_text_via_corpus_core(monkeypatch, lab_config, populated_pa
 
 def test_search_paper_semantic_via_corpus_core(monkeypatch, lab_config):
     fake = _FakeIndex(n_chunks=2, n_papers=1, model_name=lab_config.embeddings.model)
-    captured: dict = {}
 
     monkeypatch.setattr("lab_corpus_mcp.server.load_chunk_texts",
                         lambda parse_dir, idx: ["t1"])

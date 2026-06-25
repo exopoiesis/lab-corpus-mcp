@@ -12,7 +12,6 @@ from __future__ import annotations
 
 from pathlib import Path
 
-import pytest
 
 
 def test_build_mcp_app_uses_lab_tool_specs(lab_config):
@@ -172,7 +171,7 @@ def test_upload_path_traversal_rejected(lab_config):
         r = client.post("/upload",
                         files={"file": ("../../etc/passwd", b"root:x:0:0")})
         assert r.status_code == 200
-        data = r.json()
+        r.json()
         # Path traversal stripped to basename "passwd" — still saved safely,
         # OR rejected with an error. Either way it must NOT escape the inbox.
         inbox = lab_config.parse.dir / "inbox"
