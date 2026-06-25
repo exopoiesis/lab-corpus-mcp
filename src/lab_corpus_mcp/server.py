@@ -38,10 +38,6 @@ import re
 from pathlib import Path
 from typing import Any
 
-# Strict arxiv-id validator for the `ingest_arxiv_pdf` tool: must be the
-# canonical post-2007 form, optionally with a vN revision suffix.
-_ARXIV_ID_RE = re.compile(r"^\d{4}\.\d{4,5}(?:v\d+)?$")
-
 from corpus_core.corpus_index import (
     FULLTEXT_MAX_SEQ_LENGTH,
     load_chunk_texts,
@@ -50,6 +46,7 @@ from corpus_core.corpus_index import (
     search_paper_text,
     similar_to_paper,
 )
+from corpus_core.archive import PaperFiles, make_download_handler
 from corpus_core.embeddings import EmbeddingIndex, Encoder
 from corpus_core.jobs import JobError, JobHandle, JobRegistry
 from corpus_core.mcp_scaffold import (
@@ -71,6 +68,10 @@ from lab_corpus_mcp.ingest import (
 )
 
 LOG = logging.getLogger(__name__)
+
+# Strict arxiv-id validator for the `ingest_arxiv_pdf` tool: must be the
+# canonical post-2007 form, optionally with a vN revision suffix.
+_ARXIV_ID_RE = re.compile(r"^\d{4}\.\d{4,5}(?:v\d+)?$")
 
 
 class LabCorpusServer:
@@ -763,7 +764,11 @@ LAB_TOOL_SPECS: list[dict[str, Any]] = [
             "Downloads `https://arxiv.org/pdf/<arxiv_id>` and ingests "
             "with `paper_id=<arxiv_id>`. Closes the s142 dogfood gap "
             "where PDF-only arxiv papers required manual curl + "
-            "docker cp + ingest_local_dir. Async — returns {job_id}."
+            "docker cp + ingest_local_dir. Async — returns {job_id}. "
+            "TO READ THE WHOLE PARSED PAPER (markdown + figures) once done, "
+            "pull the bundle zip via the HTTP side-channel GET /download?id="
+            "<paper_id> on this server's host:port (see server instructions); "
+            "search_paper_* only returns chunks, not the full document."
         ),
         "inputSchema": {
             "type": "object",
@@ -926,6 +931,23 @@ def _make_upload_handler(server: "LabCorpusServer"):
     return upload
 
 
+def _lab_paper_files(server: "LabCorpusServer", paper_id: str) -> PaperFiles:
+    """Locate an ingested paper's pieces for the download archive.
+
+    lab-corpus keeps the markdown at `sources/<id>.md` (+ `<id>.meta.json`)
+    but copies MinerU's figures to `figures/<id>/`, while the markdown keeps
+    MinerU's `![](images/<name>)` refs — so the in-archive subdir is named
+    `images` to make those refs resolve after unzip.
+    """
+    sources_dir = server.parse_dir / "sources"
+    return PaperFiles(
+        markdown_path=sources_dir / f"{paper_id}.md",
+        media_dir=server.parse_dir / "figures" / paper_id,
+        media_arcname="images",
+        meta_path=sources_dir / f"{paper_id}.meta.json",
+    )
+
+
 def _dispatch(server: LabCorpusServer, name: str, arguments: dict[str, Any] | None) -> Any:
     """Route an MCP tool-call to the matching LabCorpusServer method.
 
@@ -934,11 +956,34 @@ def _dispatch(server: LabCorpusServer, name: str, arguments: dict[str, Any] | No
     return make_method_dispatcher(server, _tool_names())(name, arguments)
 
 
+# Server-level metadata (MCP `initialize.instructions`) — documents the two
+# binary HTTP side-channels (/upload, /download) the tool catalogue can't
+# convey. Travels with the server to every client, not one local memory.
+SERVER_INSTRUCTIONS = (
+    "lab-corpus: semantic + full-text search over non-arXiv documents "
+    "(PDF/DOCX/PPTX) parsed by MinerU. Ingest with ingest_arxiv_pdf / "
+    "ingest_url / ingest_local_dir / ingest_pdf, search with search_paper_*.\n\n"
+    "TWO BINARY SIDE-CHANNELS (NOT MCP tools — MCP JSON-RPC can't carry "
+    "files), both on the SAME host:port as this server:\n"
+    "1. UPLOAD local files to ingest:  POST /upload  (multipart; add "
+    "?ingest=true to parse immediately). The `lab-corpus-upload` CLI wraps "
+    "this: `lab-corpus-upload ~/papers/ http://<host>:<port>`.\n"
+    "2. DOWNLOAD a parsed paper:  GET /download?id=<paper_id>  -> "
+    "application/zip, after the paper is ingested. The zip is a single "
+    "<id>/ folder: <id>.md (markdown) + images/<name> figures (MinerU refs "
+    "resolve in place) + <id>.meta.json. Responses: 200 zip, 400 missing "
+    "?id=, 404 not ingested. Example:\n"
+    "    curl 'http://<host>:<port>/download?id=<paper_id>' -o paper.zip && unzip paper.zip\n"
+    "(`paper_id` is what list_corpus / ingest_* report.)"
+)
+
+
 def _build_mcp_app(server: LabCorpusServer):
     return build_mcp_app(
         server_name="lab-corpus",
         tool_specs=LAB_TOOL_SPECS,
         dispatcher=make_method_dispatcher(server, _tool_names()),
+        instructions=SERVER_INSTRUCTIONS,
     )
 
 
@@ -971,6 +1016,7 @@ async def _run_stdio(server: LabCorpusServer) -> None:
         tool_specs=LAB_TOOL_SPECS,
         dispatcher=make_method_dispatcher(server, _tool_names()),
         background_tasks=_lab_background_tasks(server),
+        instructions=SERVER_INSTRUCTIONS,
     )
 
 
@@ -994,6 +1040,7 @@ async def _run_streamable_http(server: LabCorpusServer, host: str, port: int) ->
         server_name="lab-corpus",
         tool_specs=LAB_TOOL_SPECS,
         dispatcher=make_method_dispatcher(server, _tool_names()),
+        instructions=SERVER_INSTRUCTIONS,
     )
     session_manager = StreamableHTTPSessionManager(
         app=mcp_app, json_response=True, stateless=False,
@@ -1005,6 +1052,10 @@ async def _run_streamable_http(server: LabCorpusServer, host: str, port: int) ->
     starlette_app = Starlette(routes=[
         Mount("/mcp", app=_handle_mcp),
         Route("/upload", endpoint=_make_upload_handler(server), methods=["POST"]),
+        Route("/download",
+              endpoint=make_download_handler(
+                  lambda pid: _lab_paper_files(server, pid)),
+              methods=["GET"]),
     ])
 
     bg = [asyncio.create_task(make()) for make in _lab_background_tasks(server)]

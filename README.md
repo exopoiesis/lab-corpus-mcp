@@ -194,6 +194,36 @@ Response: `{"saved": [...], "n_saved": N, "errors": [...], "inbox": "...", "job_
 `<parse.dir>/inbox/`. Call this after any manual `docker cp` / `scp`
 drop, or let `lab-corpus-upload` trigger it automatically.
 
+### Download a parsed paper (`GET /download`)
+
+The reverse side-channel, symmetric with `/upload` and shared with
+arxiv-radar via `corpus_core.archive`: pull a MinerU-parsed paper back
+as one zip (markdown + figures + meta), so it can be read/reviewed
+offline. Same binary-over-HTTP reasoning — JSON-RPC can't carry the
+figure bundle.
+
+```
+GET http://<host>:<port>/download?id=<paper_id>   →  application/zip
+```
+
+The zip holds a single `<id>/` folder so unzipped papers never collide,
+with figures placed under `images/` to match MinerU's markdown refs:
+
+```
+<id>/<id>.md            # markdown, ![](images/..) refs resolve in-place
+<id>/images/<name>      # MinerU figures (copied from figures/<id>/ on disk)
+<id>/<id>.meta.json     # ingest metadata
+```
+
+```bash
+# over the SSH-tunnelled backend (lab-corpus on :8766 → local :18766)
+curl -s "http://localhost:18766/download?id=<paper_id>" -o paper.zip
+unzip paper.zip
+```
+
+Responses: `200` zip · `400` missing `id` · `404` not ingested yet.
+(`paper_id` is what `list_corpus` / `ingest_*` report.)
+
 ## Combined mode — both backends on one Qwen
 
 Running arxiv-radar-mcp + lab-corpus-mcp as separate containers on a

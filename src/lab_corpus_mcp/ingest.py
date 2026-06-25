@@ -1,16 +1,16 @@
 """MinerU-driven ingest pipeline.
 
 Phase 2B-1 surface:
-  * `run_mineru(pdf_path, out_dir, *, timeout)` — library wrapper.
-  * `ingest_one(file_path, parse_dir, *, paper_id=None)` — full ingest
+  * `run_mineru(pdf_path, out_dir, *, timeout)` -- library wrapper.
+  * `ingest_one(file_path, parse_dir, *, paper_id=None)` -- full ingest
     of a single file: run MinerU, normalize output, write
     `<parse.dir>/sources/<paper_id>.md` + `<paper_id>.meta.json`,
     optionally copy figures into `<parse.dir>/figures/<paper_id>/`.
-  * `ingest_dir(dir_path, parse_dir, *, glob, recursive)` — bulk variant
+  * `ingest_dir(dir_path, parse_dir, *, glob, recursive)` -- bulk variant
     used by the `ingest_local_dir` MCP tool.
 
 Phase 2B+ U14 surface (2026-05-13):
-  * `fetch_and_ingest(url, parse_dir, *, paper_id=None, ...)` — download
+  * `fetch_and_ingest(url, parse_dir, *, paper_id=None, ...)` -- download
     a URL to `<parse.dir>/inbox/<filename>` via `corpus_core.fetch_url`,
     then `ingest_one()` on the result. Used by the `ingest_url` and
     `ingest_arxiv_pdf` MCP tools to close the s142 dogfood gap (no
@@ -22,10 +22,16 @@ subprocess path had two costs: (1) ~30 sec model cold-load on every
 PDF because the granchild `LocalAPIServer` died at the end of each CLI
 call; (2) HTTP overhead between CLI and LocalAPIServer. Library mode
 loads MinerU's `AtomModelSingleton` once into the lab-corpus-mcp process
-and reuses it for the whole batch. The trade-off — MinerU's GPU weights
-now share VRAM with our Qwen3 encoder — is mitigated by
+and reuses it for the whole batch. The trade-off -- MinerU's GPU weights
+now share VRAM with our Qwen3 encoder -- is mitigated by
 `unload_mineru_models()` called from the same `_release_gpu_vram` path
 that handles `Encoder.unload()`.
+
+U7 (2026-06-25): The parse mechanics (MineruRunner seam, _default_mineru_runner,
+unload_mineru_models, DEFAULT_BACKEND) have been lifted into
+`corpus_core.pdf` so that arxiv-radar-mcp can use them without depending
+on lab-corpus-mcp. This module re-exports those names as aliases so
+existing test imports continue to work without change.
 
 The `MineruRunner` injection point stays compatible: tests can still
 pass a fake runner that just writes a stub markdown without ever
@@ -37,8 +43,6 @@ import hashlib
 import logging
 import os
 import shutil
-import tempfile
-from dataclasses import asdict, replace
 from pathlib import Path
 from typing import Callable, Protocol
 from urllib.parse import urlparse
@@ -48,6 +52,17 @@ from corpus_core.http_fetch import (
     Throttle,
     fetch_url,
     get_arxiv_throttle,
+)
+
+# U7: import parse mechanics from corpus_core.pdf (the canonical home).
+# We re-export them under their original names so test imports and
+# server.py imports in lab-corpus continue to work unchanged.
+import corpus_core.pdf as _pdf_mod
+from corpus_core.pdf import (
+    DEFAULT_BACKEND,
+    MineruRunner,
+    PdfParseError as _PdfParseError,
+    parse_pdf as _parse_pdf,
 )
 
 from lab_corpus_mcp.corpus import (
@@ -66,144 +81,35 @@ class IngestError(RuntimeError):
     """Raised when MinerU fails or produces no usable markdown."""
 
 
-# Allow tests to inject a fake MinerU runner without monkeypatching subprocess.
-MineruRunner = Callable[[Path, Path, int], Path]
-"""Signature: (input_file, output_dir, timeout_seconds) -> path-to-produced-markdown."""
-
-# Default MinerU backend. `pipeline` (layout CNN + OCR + table) is what
-# we actually want on a 12 GB GPU — finishes a 2 MB PDF in ~90 sec on
-# RTX 4070. The alternative `vlm-transformers` runs MinerU's 1.2B Qwen2-VL
-# without vllm, which OOMs / wedges next to our shared Qwen3-Embedding-4B
-# (>15 min for the same input, no completion seen in a 15 min smoke).
-# Override per-call by passing `backend="vlm-transformers"` if you have
-# a 24 GB+ GPU and want the higher-fidelity output.
-DEFAULT_BACKEND = "pipeline"
-
+# ---- Backward-compat aliases (names tests + server.py import from here) ----
 
 def _default_mineru_runner(
     input_file: Path, output_dir: Path, timeout: int,
     *, backend: str = DEFAULT_BACKEND,
 ) -> Path:
-    """Real MinerU runner. Returns the produced markdown path.
+    """Backward-compat alias -> corpus_core.pdf._default_mineru_runner.
 
-    Calls `mineru.cli.common.do_parse` directly — no subprocess, no HTTP.
-    MinerU's `AtomModelSingleton` lives in this process across calls, so
-    the second PDF in a batch pays no model-load cost. After the job
-    completes, `unload_mineru_models()` frees the singletons + VRAM.
+    All real logic lives there; this shim preserves the public name that
+    lab-corpus tests (test_ingest.py) import directly from this module.
 
-    Output layout matches the CLI: MinerU writes to
-    `<output_dir>/<stem>/<parse_method>/<stem>.md` plus
-    `<output_dir>/<stem>/<parse_method>/images/`. We probe the
-    `parse_method="auto"` path first, then fall back to a recursive
-    search to absorb minor layout drifts (e.g. when MinerU's auto
-    decided txt/ocr instead of auto, or future-version layout changes).
-
-    The `timeout` parameter is accepted for backward compatibility with
-    the test seam but no longer enforced — `do_parse` is a sync Python
-    call and the caller's job-registry already wraps execution with
-    its own watchdog. To re-introduce a hard timeout, wrap this call
-    in a worker thread with a join timeout.
+    PdfParseError is re-raised as IngestError to preserve the error type
+    that lab-corpus tests and the JobRegistry expect from this module.
     """
-    # Lazy import — keeps `from lab_corpus_mcp.ingest import ...` cheap
-    # for tests / cold callers that swap in a fake runner. Pulling
-    # mineru at module-import time would load torch + ~500 MB of
-    # transitive deps even when no real parsing is going to happen.
-    from mineru.cli.common import do_parse  # noqa: PLC0415
-
-    del timeout  # see docstring; no longer enforced here.
-
-    output_dir.mkdir(parents=True, exist_ok=True)
-    stem = input_file.stem
-    pdf_bytes = input_file.read_bytes()
-    parse_method = "auto"
-
-    LOG.info(f"mineru (library): parse {input_file.name} backend={backend}")
     try:
-        do_parse(
-            output_dir=str(output_dir),
-            pdf_file_names=[stem],
-            pdf_bytes_list=[pdf_bytes],
-            p_lang_list=["ch"],   # match prior CLI default (was -l ch implicit)
-            backend=backend,
-            parse_method=parse_method,
-            formula_enable=True,
-            table_enable=True,
+        return _pdf_mod._default_mineru_runner(
+            input_file, output_dir, timeout, backend=backend
         )
-    except Exception as e:  # noqa: BLE001
-        # MinerU surfaces a mix of RuntimeError / FileNotFoundError /
-        # backend-specific exceptions. Normalize to IngestError so the
-        # JobRegistry records a clean `failed` state.
-        raise IngestError(f"mineru library call failed: {type(e).__name__}: {e}") from e
-
-    candidate = output_dir / stem / parse_method / f"{stem}.md"
-    if candidate.exists():
-        return candidate
-    # Layout drift fallback — pick the first .md MinerU produced under out_dir.
-    fallbacks = list(output_dir.rglob("*.md"))
-    if not fallbacks:
-        raise IngestError(f"mineru produced no markdown under {output_dir}")
-    return fallbacks[0]
+    except _PdfParseError as exc:
+        raise IngestError(str(exc)) from exc
 
 
 def unload_mineru_models() -> bool:
-    """Release MinerU's cached pipeline / hybrid model singletons.
+    """Backward-compat alias -> corpus_core.pdf.unload_pdf_models().
 
-    Mirrors `corpus_core.embeddings.Encoder.unload()` so the lab-corpus
-    GPU clear-out is symmetric: after a batch ingest the host's GPU
-    holds neither our Qwen3 encoder nor MinerU's layout / OCR / MFR /
-    table models, freeing VRAM for unrelated compute (~6-8 GB +
-    ~2-3 GB respectively on a 12 GB RTX 4070).
-
-    Idempotent: returns True if anything was actually released, False
-    when no MinerU model had been loaded (e.g. a server that only
-    answered search queries this lifetime).
-
-    Implementation details:
-      * `AtomModelSingleton._models` is a class-level dict keyed by
-        (model_name, lang, device, ...) → instance. Clearing the dict
-        drops the last Python references; the next forward pass after
-        re-load picks up cleanly.
-      * MinerU does NOT expose a public unload API (see
-        `MinerU/mineru/backend/pipeline/model_init.py` — no .release()
-        or close() methods on the singleton classes). We use the
-        underscore-prefixed `_models` field directly. If a future
-        MinerU release adds a public hook we should switch to that.
-      * Import is lazy so this module is safe to import on hosts
-        without MinerU installed (e.g. dev laptop running unit tests).
+    Releases MinerU's cached pipeline / hybrid model singletons.
+    Idempotent; returns True if anything was released.
     """
-    import gc
-
-    try:
-        from mineru.backend.pipeline.model_init import (  # noqa: PLC0415
-            AtomModelSingleton,
-            HybridModelSingleton,
-        )
-    except ImportError:
-        # MinerU isn't installed — nothing to unload, nothing to fail on.
-        return False
-
-    released_any = False
-    for singleton_cls in (AtomModelSingleton, HybridModelSingleton):
-        cached = getattr(singleton_cls, "_models", None)
-        if cached:
-            released_any = True
-            cached.clear()
-
-    if not released_any:
-        return False
-
-    gc.collect()
-    try:
-        import torch  # noqa: PLC0415
-
-        if torch.cuda.is_available():
-            torch.cuda.empty_cache()
-            torch.cuda.ipc_collect()
-    except ImportError:
-        pass
-
-    LOG.info("unloaded MinerU pipeline + hybrid model singletons")
-    return True
+    return _pdf_mod.unload_pdf_models()
 
 
 def run_mineru(
@@ -212,18 +118,19 @@ def run_mineru(
     runner: MineruRunner | None = None,
 ) -> Path:
     """Public entry point. When `runner=None` (the common case), invokes
-    `_default_mineru_runner` with the chosen `backend` flag.
+    `_default_mineru_runner` (via corpus_core.pdf) with the chosen `backend`.
 
     `runner` injection point is used by tests (no real MinerU subprocess)
     and the future "swap MinerU for marker" benchmark in the U7 deferred
-    work. When a custom runner is provided, `backend` is ignored — the
+    work. When a custom runner is provided, `backend` is ignored -- the
     caller's runner controls flag selection.
     """
     output_dir.mkdir(parents=True, exist_ok=True)
     if runner is not None:
         return runner(input_file, output_dir, timeout)
-    return _default_mineru_runner(input_file, output_dir, timeout,
-                                  backend=backend)
+    return _pdf_mod._default_mineru_runner(
+        input_file, output_dir, timeout, backend=backend
+    )
 
 
 def _copy_figures(produced_md: Path, target: Path) -> bool:
@@ -255,6 +162,11 @@ def ingest_one(
     `pipeline` because the VLM backend OOMs / wedges on a 12 GB GPU
     when sharing VRAM with our Qwen3-Embedding-4B encoder. Ignored if
     `runner` is supplied.
+
+    U7 (2026-06-25): internally delegates to corpus_core.pdf.parse_pdf
+    for the actual parse step, then maps the result into the lab-corpus
+    LabPaper / figures-dir format.  The public signature and output format
+    are unchanged.
     """
     if not input_file.exists():
         raise IngestError(f"input not found: {input_file}")
@@ -266,16 +178,21 @@ def ingest_one(
 
     sources_dir = parse_dir / "sources"
     figures_root = parse_dir / "figures"
+    figures_dir = figures_root / paper_id
     sources_dir.mkdir(parents=True, exist_ok=True)
 
-    with tempfile.TemporaryDirectory() as td:
-        tmp_out = Path(td)
-        produced_md = run_mineru(input_file, tmp_out, timeout=timeout,
-                                 backend=backend, runner=runner)
-        markdown = produced_md.read_text(encoding="utf-8")
+    try:
+        pdf_result = _parse_pdf(
+            input_file,
+            media_out_dir=figures_dir,
+            backend=backend,
+            runner=runner,
+        )
+    except _PdfParseError as exc:
+        raise IngestError(str(exc)) from exc
 
-        figures_dir = figures_root / paper_id
-        had_figures = _copy_figures(produced_md, figures_dir)
+    markdown = pdf_result.markdown
+    had_figures = bool(pdf_result.images)
 
     # Atomic write of the markdown source.
     out_md = sources_dir / f"{paper_id}.md"
@@ -293,7 +210,7 @@ def ingest_one(
         n_chars=len(markdown),
         n_chunks=0,
         ingested_at=utcnow_iso(),
-        figures_dir=str((figures_root / paper_id).resolve()) if had_figures else None,
+        figures_dir=str(figures_dir.resolve()) if had_figures else None,
     )
     meta_path = sources_dir / f"{paper_id}.meta.json"
     write_meta(meta_path, paper)

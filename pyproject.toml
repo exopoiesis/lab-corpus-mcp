@@ -50,7 +50,10 @@ dependencies = [
 
 [project.optional-dependencies]
 parse = [
-    "mineru[core]>=2.5",
+    # U7: parse mechanics lifted into corpus-core[pdf]; mineru is pulled
+    # transitively. Keep this alias so existing deploy scripts / docs that
+    # say `pip install lab-corpus-mcp[parse]` continue to work.
+    "corpus-core[pdf]",
 ]
 dev = [
     "pytest>=8.0",
