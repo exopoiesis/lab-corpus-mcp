@@ -12,8 +12,12 @@ embedding stack.
 
 ## What it bundles
 
-- **MinerU** for PDF / DOCX / PPTX / image parsing — same VLM-backed
-  pipeline that produces `<file>_content_list.json` + extracted figures.
+- **MinerU** for PDF / DOCX / PPTX / image parsing. Parse mechanics
+  (`parse_pdf`, `unload_pdf_models`, `is_pdf_parser_available`, `MineruRunner` seam)
+  live in `corpus_core.pdf` (U7, 2026-06-25); `lab_corpus_mcp.ingest` delegates to
+  them via `corpus-core[pdf]`. The `[parse]` extra on this package is kept as a
+  back-compat alias: `pip install lab-corpus-mcp[parse]` pulls `corpus-core[pdf]`
+  transitively. Docker image bundles MinerU directly.
 - **[`corpus-core`](https://github.com/exopoiesis/corpus-core)** —
   shared infrastructure extracted in Phase 3: `Encoder`,
   `EmbeddingIndex`, `JobRegistry`, search primitives, the chunker,
@@ -353,6 +357,14 @@ MinerU dependency.
   caches (via `unload_mineru_models()`), so the shared RTX 4070 on
   gomer is free for unrelated compute between batches. 156 lab-corpus
   tests + 119 corpus-core + 230 arxiv-radar = 505 green.
+- **U7 PDF parse mechanics lifted to corpus_core.pdf (2026-06-25):**
+  `_default_mineru_runner`, `unload_mineru_models` (now an alias for
+  `corpus_core.pdf.unload_pdf_models`), `DEFAULT_BACKEND`, and the
+  `MineruRunner` seam moved to `corpus_core.pdf` so arxiv-radar-mcp can
+  use them via `pip install arxiv-radar-mcp[pdf]` without depending on
+  lab-corpus-mcp. Existing test imports and server.py references in
+  lab-corpus continue to work -- `lab_corpus_mcp.ingest` re-exports all
+  names as aliases. The `[parse]` extra is kept as a back-compat alias.
 - **Phase 2B+ (deferred):** PDF-content DOI extraction (currently filename
   arxiv-id or sha256 prefix), slide / video loaders.
 
