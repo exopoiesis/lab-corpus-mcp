@@ -1,7 +1,7 @@
-# corpus-core and arxiv-radar-mcp are installed from git main because our
-# U7/GroupA changes are not yet on PyPI. When both siblings release PyPI
-# versions that include those changes, switch to pinned PyPI versions
-# (e.g. "corpus-core>=0.2.0", "arxiv-radar-mcp>=0.1.0").
+# corpus-core is resolved from PyPI (>=0.2.0, includes U7/Group-A), pulled
+# transitively by arxiv-radar-mcp. arxiv-radar-mcp itself is not on PyPI yet,
+# so it is installed from git main; that step also drags in corpus-core 0.2.0
+# from PyPI. When arxiv-radar-mcp releases to PyPI, drop the git-main step.
 name: tests
 
 on:
@@ -19,18 +19,17 @@ jobs:
       matrix:
         python-version: ["3.11", "3.12", "3.13"]
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v6
 
       - name: Set up Python ${{ matrix.python-version }}
-        uses: actions/setup-python@v5
+        uses: actions/setup-python@v6
         with:
           python-version: ${{ matrix.python-version }}
           cache: pip
 
-      - name: Install siblings from git main (dependency order)
+      - name: Install arxiv-radar-mcp from git main (pulls corpus-core from PyPI)
         run: |
           python -m pip install --upgrade pip
-          python -m pip install "corpus-core @ git+https://github.com/exopoiesis/corpus-core@main"
           python -m pip install "arxiv-radar-mcp @ git+https://github.com/exopoiesis/arxiv-radar-mcp@main"
 
       - name: Install package + dev extras
@@ -46,22 +45,18 @@ jobs:
     runs-on: ubuntu-latest
     needs: test
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v6
 
-      - uses: actions/setup-python@v5
+      - uses: actions/setup-python@v6
         with:
           python-version: "3.12"
 
-      - name: Install siblings from git main (dependency order)
+      - name: Build sdist + wheel
         run: |
           python -m pip install --upgrade pip build
-          python -m pip install "corpus-core @ git+https://github.com/exopoiesis/corpus-core@main"
-          python -m pip install "arxiv-radar-mcp @ git+https://github.com/exopoiesis/arxiv-radar-mcp@main"
+          python -m build
 
-      - name: Build sdist + wheel
-        run: python -m build
-
-      - uses: actions/upload-artifact@v4
+      - uses: actions/upload-artifact@v7
         with:
           name: lab-corpus-mcp-dist
           path: dist/
